@@ -66,7 +66,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
     - Verify:
       - Repeat CI run → cache hit for the Cargo build and the model on all 3 runners, no `ort-sys` build.
       - Test made to fail → `test` step fails on all 3 runners.
-  - F2. Register a device: deployable stack and `POST /v1/devices` create a user and a device. Docs: design, tasks. Needs: none. Status: not started.
+  - F2. Register a device: deployable stack and `POST /v1/devices` create a user and a device. Docs: design, tasks. Needs: none. Status: done.
     - Verify (Local, except where tagged):
       - Valid GitHub token + device name → `{device_id, token}`. `users` has `gh:<GitHub id>`. `devices` key is the SHA-256 of `token`. No stored item holds the raw `token` or the GitHub token.
       - Second login, same GitHub account → new `device_id`, same `user_id`.
@@ -262,6 +262,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
 ## Deferred
 - NFR5 (99.5% availability). Met by managed-service SLAs per design D19; no monitoring in P0, so no milestone verifies it.
 - US15 to US20, FR35 and P1 Memory Management: out of scope for P0 per requirements. Codex CLI is the first P1 agent.
+- Service tests in CI (P1): a Linux CI job with a DynamoDB Local container that runs the `loremaster-service` tests. In P0 they run on the developer machine only (M2 F2 design D1).
 
 ## Coverage
 | Requirement or component | Milestones |

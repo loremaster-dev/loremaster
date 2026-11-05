@@ -1,2 +1,4 @@
 /target
 progress.md
+/infra/.aws-sam
+verify/
