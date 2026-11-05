@@ -331,7 +331,7 @@ sequenceDiagram
 ---
 
 ## Setup Flow (F1, F2, FR10)
-- 1. `curl -fsSL https://github.com/<org>/loremaster/releases/latest/download/install.sh | sh`: detect OS/arch, download binary from the same GitHub Release, verify SHA-256, install to `~/.loremaster/bin`.
+- 1. `curl -fsSL https://github.com/loremaster-dev/loremaster/releases/latest/download/install.sh | sh`: detect OS/arch, download binary from the same GitHub Release, verify SHA-256, install to `~/.loremaster/bin`.
 - 2. `loremaster setup`: login (Section 7), install service unit, detect agents, write hooks.
 - 3. Bootstrap pull with progress (Section 4).
 - Builds: GitHub Actions for macOS arm64, Linux x86_64/arm64 (NFR8). No Intel Mac: `ort` ships no prebuilt ONNX Runtime for `x86_64-apple-darwin`.
