@@ -183,6 +183,20 @@ pub struct Record {
     pub evict_key: Option<String>,
 }
 
+/// Body of `POST /v1/devices`: a GitHub token that proves the account, and a name for the device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterDevice {
+    pub github_token: String,
+    pub name: String,
+}
+
+/// Reply to a device registration. `token` is shown once; the service keeps only its hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceCredential {
+    pub device_id: String,
+    pub token: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +369,36 @@ mod tests {
         assert!(
             serde_json::from_str::<Record>(r#"{"hlc":"1761750000123-00002-w","writer":"w"}"#)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn device_api_bodies_use_the_wire_field_names() {
+        let request: RegisterDevice =
+            serde_json::from_str(r#"{"github_token":"gho_x","name":"laptop"}"#).unwrap();
+        assert_eq!(
+            request,
+            RegisterDevice {
+                github_token: "gho_x".to_owned(),
+                name: "laptop".to_owned(),
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({"github_token": "gho_x", "name": "laptop"})
+        );
+        let credential = DeviceCredential {
+            device_id: "dev_01JBQ8Z6K4M2T9X0R5N7C3V1HD".to_owned(),
+            token: "ab".repeat(32),
+        };
+        let json = serde_json::to_value(&credential).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"device_id": "dev_01JBQ8Z6K4M2T9X0R5N7C3V1HD", "token": "ab".repeat(32)})
+        );
+        assert_eq!(
+            serde_json::from_value::<DeviceCredential>(json).unwrap(),
+            credential
         );
     }
 }

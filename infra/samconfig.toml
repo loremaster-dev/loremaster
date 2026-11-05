@@ -1,0 +1,15 @@
+version = 0.1
+
+[dev.global.parameters]
+stack_name = "loremaster-dev"
+region = "us-east-2"
+profile = "loremaster"
+
+[dev.build.parameters]
+# Building Rust with cargo-lambda is a SAM beta feature.
+beta_features = true
+
+[dev.deploy.parameters]
+resolve_s3 = true
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false

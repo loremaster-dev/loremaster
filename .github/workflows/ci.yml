@@ -31,4 +31,5 @@ jobs:
       - name: test without dev tools
         run: cargo test --locked -p loremaster --test cli
       - name: test
-        run: cargo test --locked --workspace --all-features
+        # The service tests need DynamoDB Local (infra/local.sh), so they run on developer machines only.
+        run: cargo test --locked --workspace --all-features --exclude loremaster-service
