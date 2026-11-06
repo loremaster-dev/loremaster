@@ -152,3 +152,25 @@ async fn storage_failure_on_device_routes_is_500() {
         assert!(body["error"].is_string(), "{body}");
     }
 }
+
+#[tokio::test]
+async fn deleting_a_device_frees_a_slot() {
+    let service = Service::start().await;
+    let mut devices = Vec::new();
+    for n in 0..10 {
+        devices.push(register(&service, ALICE, &format!("device {n}")).await);
+    }
+    let (status, _) = service.register(ALICE, "one too many").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let (status, _) = service
+        .delete(&device_path(&devices[0].device_id), &devices[1].token)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let users = service.scan(&service.users_table).await;
+    assert_eq!(users[0]["device_count"].as_n().unwrap(), "9");
+
+    register(&service, ALICE, "fits again").await;
+    let users = service.scan(&service.users_table).await;
+    assert_eq!(users[0]["device_count"].as_n().unwrap(), "10");
+}

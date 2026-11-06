@@ -3,7 +3,8 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{ALICE, ALICE_ID, BROKEN, SLOW, Service, string};
+use common::{ALICE, ALICE_ID, BOB, BROKEN, SLOW, Service, string};
+use loremaster_core::{DeviceCredential, DeviceLimitReached, DeviceList};
 use sha2::{Digest, Sha256};
 
 fn sha256_hex(text: &str) -> String {
@@ -132,4 +133,164 @@ async fn storage_failure_is_500() {
     let (status, body) = service.register(ALICE, "laptop").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(body["error"].is_string(), "{body}");
+}
+
+const DEVICE_LIMIT: usize = 10;
+
+async fn register_ok(service: &Service, github_token: &str, name: &str) -> DeviceCredential {
+    let (status, body) = service.register(github_token, name).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    serde_json::from_value(body).unwrap()
+}
+
+async fn register_devices(service: &Service, count: usize) -> Vec<DeviceCredential> {
+    let mut devices = Vec::new();
+    for n in 0..count {
+        devices.push(register_ok(service, ALICE, &format!("device {n}")).await);
+    }
+    devices
+}
+
+async fn replace(
+    service: &Service,
+    replace_device_id: &str,
+    name: &str,
+) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({
+        "github_token": ALICE,
+        "name": name,
+        "replace_device_id": replace_device_id,
+    });
+    service.post("/v1/devices", body.to_string()).await
+}
+
+async fn alice_device_count(service: &Service) -> u64 {
+    let users = service.scan(&service.users_table).await;
+    let alice = users
+        .iter()
+        .find(|user| string(user, "user_id") == format!("gh:{ALICE_ID}"))
+        .unwrap();
+    alice["device_count"].as_n().unwrap().parse().unwrap()
+}
+
+async fn alice_device_ids(service: &Service) -> Vec<String> {
+    let mut ids: Vec<_> = service
+        .scan(&service.devices_table)
+        .await
+        .iter()
+        .filter(|item| string(item, "user_id") == format!("gh:{ALICE_ID}"))
+        .map(|item| string(item, "device_id"))
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn eleventh_device_is_409_with_the_list() {
+    let service = Service::start().await;
+    let devices = register_devices(&service, DEVICE_LIMIT).await;
+    assert_eq!(alice_device_count(&service).await, DEVICE_LIMIT as u64);
+
+    let (status, body) = service.register(ALICE, "one too many").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let refused: DeviceLimitReached = serde_json::from_value(body).unwrap();
+    assert!(!refused.error.is_empty());
+    let listed: Vec<_> = refused
+        .devices
+        .iter()
+        .map(|d| d.device_id.clone())
+        .collect();
+    let registered: Vec<_> = devices.iter().map(|d| d.device_id.clone()).collect();
+    assert_eq!(listed, registered);
+    let names: Vec<_> = refused.devices.iter().map(|d| d.name.clone()).collect();
+    assert_eq!(names[0], "device 0");
+
+    assert_eq!(alice_device_ids(&service).await.len(), DEVICE_LIMIT);
+    assert_eq!(alice_device_count(&service).await, DEVICE_LIMIT as u64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_logins_stop_at_ten() {
+    let service = Service::start().await;
+    register_devices(&service, DEVICE_LIMIT - 1).await;
+
+    let (first, second) = tokio::join!(
+        service.register(ALICE, "racer a"),
+        service.register(ALICE, "racer b")
+    );
+    let mut statuses = [first.0, second.0];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::CREATED, StatusCode::CONFLICT],
+        "{} / {}",
+        first.1,
+        second.1
+    );
+    assert_eq!(alice_device_ids(&service).await.len(), DEVICE_LIMIT);
+    assert_eq!(alice_device_count(&service).await, DEVICE_LIMIT as u64);
+}
+
+#[tokio::test]
+async fn replacing_a_device_keeps_ten() {
+    let service = Service::start().await;
+    let devices = register_devices(&service, DEVICE_LIMIT).await;
+    let old = &devices[3];
+
+    let (status, body) = replace(&service, &old.device_id, "new laptop").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let new: DeviceCredential = serde_json::from_value(body).unwrap();
+
+    let (status, _) = service.get("/v1/devices", &old.token).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, body) = service.get("/v1/devices", &new.token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let list: DeviceList = serde_json::from_value(body).unwrap();
+    assert_eq!(list.devices.len(), DEVICE_LIMIT);
+    assert!(list.devices.iter().all(|d| d.device_id != old.device_id));
+    let added = list
+        .devices
+        .iter()
+        .find(|d| d.device_id == new.device_id)
+        .unwrap();
+    assert_eq!(added.name, "new laptop");
+
+    assert_eq!(alice_device_ids(&service).await.len(), DEVICE_LIMIT);
+    assert_eq!(alice_device_count(&service).await, DEVICE_LIMIT as u64);
+}
+
+#[tokio::test]
+async fn replacing_a_device_that_is_not_the_users_is_404() {
+    let service = Service::start().await;
+    register_devices(&service, 2).await;
+    let bob_box = register_ok(&service, BOB, "bob box").await;
+    let before = alice_device_ids(&service).await;
+    let missing = format!("dev_{}", loremaster_core::new_ulid());
+
+    for device_id in [bob_box.device_id.as_str(), missing.as_str()] {
+        let (status, body) = replace(&service, device_id, "intruder").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{device_id}: {body}");
+        assert!(body["error"].is_string(), "{body}");
+    }
+
+    assert_eq!(alice_device_ids(&service).await, before);
+    assert_eq!(alice_device_count(&service).await, 2);
+    let (status, body) = service.get("/v1/devices", &bob_box.token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["devices"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn replacing_below_the_limit_works() {
+    let service = Service::start().await;
+    let devices = register_devices(&service, 2).await;
+
+    let (status, body) = replace(&service, &devices[0].device_id, "replacement").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let new: DeviceCredential = serde_json::from_value(body).unwrap();
+
+    let mut expected = vec![devices[1].device_id.clone(), new.device_id];
+    expected.sort();
+    assert_eq!(alice_device_ids(&service).await, expected);
+    assert_eq!(alice_device_count(&service).await, 2);
 }

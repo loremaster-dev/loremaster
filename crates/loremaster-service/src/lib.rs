@@ -1,15 +1,16 @@
 //! The sync service: one `axum` router that runs in a Lambda behind an HTTP API.
 
+use std::collections::HashMap;
+use std::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use std::collections::HashMap;
-use std::fmt::Display;
-
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::DisplayErrorContext;
-use aws_sdk_dynamodb::operation::delete_item::DeleteItemError;
-use aws_sdk_dynamodb::types::{AttributeValue, Put, TransactWriteItem, Update};
+use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
+use aws_sdk_dynamodb::types::{
+    AttributeValue, CancellationReason, Delete, Put, TransactWriteItem, Update,
+};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Request, State};
 use axum::http::{StatusCode, header};
@@ -17,13 +18,15 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
-use loremaster_core::{Device, DeviceCredential, DeviceList, RegisterDevice};
+use loremaster_core::{Device, DeviceCredential, DeviceLimitReached, DeviceList, RegisterDevice};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const MAX_DEVICE_NAME_CHARS: usize = 64;
 const GITHUB_TIMEOUT: Duration = Duration::from_secs(5);
+const DEVICE_LIMIT: u32 = 10;
+const TRANSACTION_TRIES: u32 = 3;
 
 /// Where the service keeps its data and checks GitHub accounts.
 pub struct Config {
@@ -96,22 +99,28 @@ enum ApiError {
     Unauthorized,
     #[error("no such device")]
     DeviceNotFound,
+    #[error("device limit reached")]
+    DeviceLimit(Vec<Device>),
     #[error("internal error")]
     Internal,
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let error = self.to_string();
         let status = match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::BadGithubToken => StatusCode::UNAUTHORIZED,
             Self::GithubUnavailable => StatusCode::BAD_GATEWAY,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::DeviceNotFound => StatusCode::NOT_FOUND,
+            Self::DeviceLimit(devices) => {
+                let body = DeviceLimitReached { error, devices };
+                return (StatusCode::CONFLICT, Json(body)).into_response();
+            }
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        let body = serde_json::json!({"error": self.to_string()});
-        (status, Json(body)).into_response()
+        (status, Json(serde_json::json!({ "error": error }))).into_response()
     }
 }
 
@@ -134,7 +143,11 @@ async fn register_device(
         device_id: format!("dev_{}", loremaster_core::new_ulid()),
         token: new_token(),
     };
-    store_device(&state, &user_id, name, &credential).await?;
+    let device = new_device(&state, &user_id, name, &credential)?;
+    match request.replace_device_id {
+        None => add_device(&state, &user_id, device).await?,
+        Some(old_device_id) => replace_device(&state, &user_id, &old_device_id, device).await?,
+    }
     Ok((StatusCode::CREATED, Json(credential)))
 }
 
@@ -182,29 +195,18 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Creates the user if new and the device, in one transaction, so a user never exists without one.
-async fn store_device(
+fn new_device(
     state: &AppState,
     user_id: &str,
     name: &str,
     credential: &DeviceCredential,
-) -> Result<(), ApiError> {
+) -> Result<TransactWriteItem, ApiError> {
     let s = |value: &str| AttributeValue::S(value.to_owned());
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(internal)?
         .as_millis();
-    let user = Update::builder()
-        .table_name(&state.config.users_table)
-        .key("user_id", s(user_id))
-        .update_expression(
-            "SET next_seq = if_not_exists(next_seq, :zero), \
-             live_count = if_not_exists(live_count, :zero)",
-        )
-        .expression_attribute_values(":zero", AttributeValue::N("0".to_owned()))
-        .build()
-        .map_err(internal)?;
-    let device = Put::builder()
+    let put = Put::builder()
         .table_name(&state.config.devices_table)
         .item("token_hash", s(&token_hash(&credential.token)))
         .item("user_id", s(user_id))
@@ -214,15 +216,120 @@ async fn store_device(
         .condition_expression("attribute_not_exists(token_hash)")
         .build()
         .map_err(internal)?;
-    state
-        .dynamo
-        .transact_write_items()
-        .transact_items(TransactWriteItem::builder().update(user).build())
-        .transact_items(TransactWriteItem::builder().put(device).build())
-        .send()
-        .await
-        .map_err(|error| internal(DisplayErrorContext(error)))?;
-    Ok(())
+    Ok(TransactWriteItem::builder().put(put).build())
+}
+
+/// Creates the user if new and takes one of its device slots, in the same transaction as the
+/// device, so concurrent logins cannot pass the limit and a user never exists without a device.
+async fn add_device(
+    state: &AppState,
+    user_id: &str,
+    device: TransactWriteItem,
+) -> Result<(), ApiError> {
+    let user = Update::builder()
+        .table_name(&state.config.users_table)
+        .key("user_id", AttributeValue::S(user_id.to_owned()))
+        .update_expression(
+            "SET next_seq = if_not_exists(next_seq, :zero), \
+             live_count = if_not_exists(live_count, :zero), \
+             device_count = if_not_exists(device_count, :zero) + :one",
+        )
+        .condition_expression("attribute_not_exists(device_count) OR device_count < :limit")
+        .expression_attribute_values(":zero", number(0))
+        .expression_attribute_values(":one", number(1))
+        .expression_attribute_values(":limit", number(DEVICE_LIMIT))
+        .build()
+        .map_err(internal)?;
+    let user = TransactWriteItem::builder().update(user).build();
+    match transact(state, vec![user, device]).await {
+        Ok(()) => Ok(()),
+        Err(TransactError::ConditionFailed(0)) => {
+            Err(ApiError::DeviceLimit(sorted_devices(state, user_id).await?))
+        }
+        Err(TransactError::ConditionFailed(_)) => Err(internal("new device token already exists")),
+        Err(TransactError::Storage(error)) => Err(error),
+    }
+}
+
+/// Removes one of the user's devices and adds the new one in one transaction, so the user's
+/// device count stays the same and a failed write never leaves the user a device short.
+async fn replace_device(
+    state: &AppState,
+    user_id: &str,
+    old_device_id: &str,
+    device: TransactWriteItem,
+) -> Result<(), ApiError> {
+    let old = remove_own_device(state, user_id, old_device_id).await?;
+    match transact(state, vec![old, device]).await {
+        Ok(()) => Ok(()),
+        Err(TransactError::ConditionFailed(0)) => Err(ApiError::DeviceNotFound),
+        Err(TransactError::ConditionFailed(_)) => Err(internal("new device token already exists")),
+        Err(TransactError::Storage(error)) => Err(error),
+    }
+}
+
+fn number(value: u32) -> AttributeValue {
+    AttributeValue::N(value.to_string())
+}
+
+enum TransactError {
+    /// The condition on the item at this index in the transaction failed.
+    ConditionFailed(usize),
+    Storage(ApiError),
+}
+
+/// Runs a transaction. Tries again when another transaction on the same items ran at the same
+/// moment, because the SDK does not retry a cancelled transaction.
+async fn transact(state: &AppState, items: Vec<TransactWriteItem>) -> Result<(), TransactError> {
+    let mut tries = 1;
+    loop {
+        let result = state
+            .dynamo
+            .transact_write_items()
+            .set_transact_items(Some(items.clone()))
+            .send()
+            .await;
+        let Err(error) = result else {
+            return Ok(());
+        };
+        let next = match error.as_service_error() {
+            Some(TransactWriteItemsError::TransactionCanceledException(cancelled)) => {
+                on_cancel(cancelled.cancellation_reasons(), tries)
+            }
+            _ => Cancelled::Fail,
+        };
+        match next {
+            Cancelled::Retry => tries += 1,
+            Cancelled::ConditionFailed(index) => return Err(TransactError::ConditionFailed(index)),
+            Cancelled::Fail => {
+                return Err(TransactError::Storage(internal(DisplayErrorContext(error))));
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Cancelled {
+    Retry,
+    ConditionFailed(usize),
+    Fail,
+}
+
+/// What to do after a cancelled transaction, from its reason for each item. A failed condition
+/// wins over a conflict, since a retry cannot make that condition pass.
+fn on_cancel(reasons: &[CancellationReason], tries: u32) -> Cancelled {
+    let has = |code| {
+        reasons
+            .iter()
+            .position(|reason| reason.code() == Some(code))
+    };
+    if let Some(index) = has("ConditionalCheckFailed") {
+        Cancelled::ConditionFailed(index)
+    } else if has("TransactionConflict").is_some() && tries < TRANSACTION_TRIES {
+        Cancelled::Retry
+    } else {
+        Cancelled::Fail
+    }
 }
 
 fn internal(error: impl Display) -> ApiError {
@@ -269,13 +376,19 @@ async fn list_devices(
     State(state): State<AppState>,
     Extension(UserId(user_id)): Extension<UserId>,
 ) -> Result<Json<DeviceList>, ApiError> {
-    let mut devices = user_devices(&state, &user_id)
+    let devices = sorted_devices(&state, &user_id).await?;
+    Ok(Json(DeviceList { devices }))
+}
+
+/// The user's devices, oldest first. Device ids are time-ordered, so they break a tie.
+async fn sorted_devices(state: &AppState, user_id: &str) -> Result<Vec<Device>, ApiError> {
+    let mut devices = user_devices(state, user_id)
         .await?
         .iter()
         .map(device_from_item)
         .collect::<Result<Vec<_>, _>>()?;
-    devices.sort_by_key(|device| device.created_at);
-    Ok(Json(DeviceList { devices }))
+    devices.sort_by(|a, b| (a.created_at, &a.device_id).cmp(&(b.created_at, &b.device_id)));
+    Ok(devices)
 }
 
 async fn delete_device(
@@ -283,33 +396,53 @@ async fn delete_device(
     Extension(UserId(user_id)): Extension<UserId>,
     Path(device_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let items = user_devices(&state, &user_id).await?;
+    let device = remove_own_device(&state, &user_id, &device_id).await?;
+    let user = Update::builder()
+        .table_name(&state.config.users_table)
+        .key("user_id", AttributeValue::S(user_id))
+        .update_expression("SET device_count = device_count - :one")
+        .condition_expression("device_count > :zero")
+        .expression_attribute_values(":zero", number(0))
+        .expression_attribute_values(":one", number(1))
+        .build()
+        .map_err(internal)?;
+    let user = TransactWriteItem::builder().update(user).build();
+    match transact(&state, vec![device, user]).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(TransactError::ConditionFailed(0)) => Err(ApiError::DeviceNotFound),
+        Err(TransactError::ConditionFailed(_)) => Err(internal("device count is already 0")),
+        Err(TransactError::Storage(error)) => Err(error),
+    }
+}
+
+/// A transaction item that deletes one of the user's devices. Its condition fails when the device
+/// is gone or belongs to another user, which the `by_user` index can still show for a moment.
+async fn remove_own_device(
+    state: &AppState,
+    user_id: &str,
+    device_id: &str,
+) -> Result<TransactWriteItem, ApiError> {
+    let items = user_devices(state, user_id).await?;
     let item = items
         .iter()
-        .find(|item| item.get("device_id").and_then(|id| id.as_s().ok()) == Some(&device_id))
+        .find(|item| {
+            item.get("device_id")
+                .and_then(|id| id.as_s().ok())
+                .map(String::as_str)
+                == Some(device_id)
+        })
         .ok_or(ApiError::DeviceNotFound)?;
-    let token_hash = attribute_s(item, "token_hash")?;
-    let result = state
-        .dynamo
-        .delete_item()
+    let delete = Delete::builder()
         .table_name(&state.config.devices_table)
-        .key("token_hash", AttributeValue::S(token_hash.to_owned()))
+        .key(
+            "token_hash",
+            AttributeValue::S(attribute_s(item, "token_hash")?.to_owned()),
+        )
         .condition_expression("attribute_exists(token_hash) AND user_id = :user_id")
-        .expression_attribute_values(":user_id", AttributeValue::S(user_id))
-        .send()
-        .await;
-    match result {
-        Ok(_) => Ok(StatusCode::NO_CONTENT),
-        Err(error)
-            if matches!(
-                error.as_service_error(),
-                Some(DeleteItemError::ConditionalCheckFailedException(_))
-            ) =>
-        {
-            Err(ApiError::DeviceNotFound)
-        }
-        Err(error) => Err(internal(DisplayErrorContext(error))),
-    }
+        .expression_attribute_values(":user_id", AttributeValue::S(user_id.to_owned()))
+        .build()
+        .map_err(internal)?;
+    Ok(TransactWriteItem::builder().delete(delete).build())
 }
 
 type Item = HashMap<String, AttributeValue>;
@@ -350,4 +483,49 @@ fn attribute_s<'a>(item: &'a Item, name: &str) -> Result<&'a str, ApiError> {
         .and_then(|value| value.as_s().ok())
         .map(String::as_str)
         .ok_or_else(|| internal(format!("device item has no string {name}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reasons(codes: &[&str]) -> Vec<CancellationReason> {
+        codes
+            .iter()
+            .map(|code| CancellationReason::builder().code(*code).build())
+            .collect()
+    }
+
+    #[test]
+    fn a_cancelled_transaction_is_retried_only_for_a_conflict_and_at_most_three_times() {
+        let cases = [
+            (
+                &["None", "ConditionalCheckFailed"][..],
+                1,
+                Cancelled::ConditionFailed(1),
+            ),
+            (
+                &["ConditionalCheckFailed", "None"],
+                3,
+                Cancelled::ConditionFailed(0),
+            ),
+            (&["TransactionConflict", "None"], 1, Cancelled::Retry),
+            (&["None", "TransactionConflict"], 2, Cancelled::Retry),
+            (&["TransactionConflict", "None"], 3, Cancelled::Fail),
+            (
+                &["TransactionConflict", "ConditionalCheckFailed"],
+                1,
+                Cancelled::ConditionFailed(1),
+            ),
+            (&["ValidationError", "None"], 1, Cancelled::Fail),
+            (&[], 1, Cancelled::Fail),
+        ];
+        for (codes, tries, expected) in cases {
+            assert_eq!(
+                on_cancel(&reasons(codes), tries),
+                expected,
+                "{codes:?} on try {tries}"
+            );
+        }
+    }
 }
