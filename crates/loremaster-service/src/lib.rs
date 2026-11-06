@@ -10,9 +10,11 @@ use aws_sdk_dynamodb::error::DisplayErrorContext;
 use aws_sdk_dynamodb::operation::transact_get_items::TransactGetItemsError;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::types::{
-    AttributeValue, CancellationReason, Delete, Get, KeysAndAttributes, Put, TransactGetItem,
-    TransactWriteItem, Update,
+    AttributeValue, CancellationReason, ConditionCheck, Delete, DeleteRequest, Get,
+    KeysAndAttributes, Put, TransactGetItem, TransactWriteItem, Update, WriteRequest,
 };
+use aws_sdk_lambda::primitives::Blob;
+use aws_sdk_lambda::types::InvocationType;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::{StatusCode, header};
@@ -20,11 +22,13 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
+use lambda_http::request::LambdaRequest;
 use loremaster_core::{
     Device, DeviceCredential, DeviceLimitReached, DeviceList, Hlc, PullResponse, PushRequest,
     PushResponse, Record, RecordType, RegisterDevice, Scope,
 };
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -34,6 +38,9 @@ const DEVICE_LIMIT: u32 = 10;
 const TRANSACTION_TRIES: u32 = 3;
 const MAX_PUSH_RECORDS: usize = 99;
 const MAX_TEXT_CHARS: usize = 2_000;
+const BATCH_WRITE_ITEMS: usize = 25;
+const UNPROCESSED_BACKOFF: Duration = Duration::from_millis(50);
+const MAX_UNPROCESSED_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Where the service keeps its data and checks GitHub accounts.
 pub struct Config {
@@ -69,6 +76,14 @@ pub struct AppState {
     dynamo: Client,
     github: reqwest::Client,
     config: Arc<Config>,
+    purger: Option<Purger>,
+}
+
+/// The Lambda function that runs account purges in the background: this one.
+#[derive(Clone)]
+struct Purger {
+    lambda: aws_sdk_lambda::Client,
+    function_name: String,
 }
 
 impl AppState {
@@ -82,6 +97,19 @@ impl AppState {
             dynamo,
             github,
             config: Arc::new(config),
+            purger: None,
+        }
+    }
+
+    /// Runs account purges as async invocations of the Lambda function `function_name`. Without
+    /// this, `DELETE /v1/account` purges before it replies.
+    pub fn with_purger(self, lambda: aws_sdk_lambda::Client, function_name: String) -> Self {
+        Self {
+            purger: Some(Purger {
+                lambda,
+                function_name,
+            }),
+            ..self
         }
     }
 }
@@ -92,6 +120,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/devices/{id}", delete(delete_device))
         .route("/v1/sync/push", post(push_records))
         .route("/v1/sync/pull", get(pull_records))
+        .route("/v1/account", delete(delete_account))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
         .route("/v1/devices", post(register_device))
@@ -115,6 +144,8 @@ enum ApiError {
     DeviceLimit(Vec<Device>),
     #[error("retry")]
     Conflict,
+    #[error("account deletion in progress")]
+    DeletionInProgress,
     #[error("internal error")]
     Internal,
 }
@@ -132,7 +163,7 @@ impl IntoResponse for ApiError {
                 let body = DeviceLimitReached { error, devices };
                 return (StatusCode::CONFLICT, Json(body)).into_response();
             }
-            Self::Conflict => StatusCode::CONFLICT,
+            Self::Conflict | Self::DeletionInProgress => StatusCode::CONFLICT,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(serde_json::json!({ "error": error }))).into_response()
@@ -249,7 +280,10 @@ async fn add_device(
              live_count = if_not_exists(live_count, :zero), \
              device_count = if_not_exists(device_count, :zero) + :one",
         )
-        .condition_expression("attribute_not_exists(device_count) OR device_count < :limit")
+        .condition_expression(
+            "(attribute_not_exists(device_count) OR device_count < :limit) \
+             AND attribute_not_exists(deleting)",
+        )
         .expression_attribute_values(":zero", number(0))
         .expression_attribute_values(":one", number(1))
         .expression_attribute_values(":limit", number(DEVICE_LIMIT))
@@ -258,6 +292,9 @@ async fn add_device(
     let user = TransactWriteItem::builder().update(user).build();
     match transact(state, vec![user, device]).await {
         Ok(()) => Ok(()),
+        Err(TransactError::ConditionFailed(0)) if is_deleting(state, user_id).await? => {
+            Err(ApiError::DeletionInProgress)
+        }
         Err(TransactError::ConditionFailed(0)) => {
             Err(ApiError::DeviceLimit(sorted_devices(state, user_id).await?))
         }
@@ -275,12 +312,37 @@ async fn replace_device(
     device: TransactWriteItem,
 ) -> Result<(), ApiError> {
     let old = remove_own_device(state, user_id, old_device_id).await?;
-    match transact(state, vec![old, device]).await {
+    let not_deleting = ConditionCheck::builder()
+        .table_name(&state.config.users_table)
+        .key("user_id", AttributeValue::S(user_id.to_owned()))
+        .condition_expression("attribute_not_exists(deleting)")
+        .build()
+        .map_err(internal)?;
+    let not_deleting = TransactWriteItem::builder()
+        .condition_check(not_deleting)
+        .build();
+    match transact(state, vec![old, device, not_deleting]).await {
         Ok(()) => Ok(()),
         Err(TransactError::ConditionFailed(0)) => Err(ApiError::DeviceNotFound),
-        Err(TransactError::ConditionFailed(_)) => Err(internal("new device token already exists")),
+        Err(TransactError::ConditionFailed(1)) => Err(internal("new device token already exists")),
+        Err(TransactError::ConditionFailed(_)) => Err(ApiError::DeletionInProgress),
         Err(TransactError::Storage(error)) => Err(error),
     }
+}
+
+/// Whether the user's account is being deleted.
+async fn is_deleting(state: &AppState, user_id: &str) -> Result<bool, ApiError> {
+    let user = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.users_table)
+        .key("user_id", AttributeValue::S(user_id.to_owned()))
+        .consistent_read(true)
+        .projection_expression("deleting")
+        .send()
+        .await
+        .map_err(|error| internal(DisplayErrorContext(error)))?;
+    Ok(user.item.is_some_and(|item| item.contains_key("deleting")))
 }
 
 fn number(value: u32) -> AttributeValue {
@@ -554,7 +616,9 @@ async fn push_records(
         .table_name(&state.config.users_table)
         .key("user_id", AttributeValue::S(caller.user_id.clone()))
         .update_expression("SET next_seq = :new, live_count = live_count + :delta")
-        .condition_expression("next_seq = :old")
+        // A push that passed auth just before an account deletion must not write rows that the
+        // purge has already listed.
+        .condition_expression("next_seq = :old AND attribute_not_exists(deleting)")
         .expression_attribute_values(":old", AttributeValue::N(next_seq.to_string()))
         .expression_attribute_values(":new", AttributeValue::N(new_next_seq.to_string()))
         .expression_attribute_values(":delta", AttributeValue::N(live_delta.to_string()))
@@ -568,7 +632,8 @@ async fn push_records(
                 .map(|record| record.memory_id.clone())
                 .collect(),
         })),
-        // Another push for this user wrote between the reads and this write.
+        // Another push for this user wrote between the reads and this write, or the account is
+        // being deleted.
         Err(TransactError::ConditionFailed(_)) => Err(ApiError::Conflict),
         Err(TransactError::Storage(error)) => Err(error),
     }
@@ -927,6 +992,172 @@ fn record_from_item(item: &Item) -> Result<Record, ApiError> {
     serde_json::from_value(fields.into()).map_err(internal)
 }
 
+/// Marks the account as being deleted, so no device can sign up for it, then revokes every device
+/// token. The rows go in a purge after the reply. If that purge never ends, the marker stays and
+/// shows the account.
+async fn delete_account(
+    State(state): State<AppState>,
+    Extension(Caller { user_id, .. }): Extension<Caller>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.users_table)
+        .key("user_id", AttributeValue::S(user_id.clone()))
+        .update_expression("SET deleting = :true")
+        .expression_attribute_values(":true", AttributeValue::Bool(true))
+        .send()
+        .await
+        .map_err(|error| internal(DisplayErrorContext(error)))?;
+    let devices = device_keys(&state, &user_id).await?;
+    batch_delete(&state, &state.config.devices_table, devices).await?;
+    match &state.purger {
+        Some(Purger {
+            lambda,
+            function_name,
+        }) => {
+            let event = serde_json::json!({ "purge_user_id": user_id });
+            lambda
+                .invoke()
+                .function_name(function_name)
+                .invocation_type(InvocationType::Event)
+                .payload(Blob::new(event.to_string()))
+                .send()
+                .await
+                .map_err(|error| internal(DisplayErrorContext(error)))?;
+        }
+        None => purge(&state, &user_id).await?,
+    }
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// One invocation of the Lambda function: a request from the HTTP API, or an account purge that
+/// `DELETE /v1/account` sent to the function itself.
+#[derive(Debug)]
+pub enum Event {
+    Purge { user_id: String },
+    Http(Box<LambdaRequest>),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PurgeEvent {
+    purge_user_id: String,
+}
+
+impl<'de> Deserialize<'de> for Event {
+    /// Reads the payload once, because `LambdaRequest` only reads raw JSON and so cannot be a
+    /// variant of an untagged enum.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        if let Ok(PurgeEvent { purge_user_id }) = serde_json::from_str(raw.get()) {
+            return Ok(Self::Purge {
+                user_id: purge_user_id,
+            });
+        }
+        serde_json::from_str(raw.get())
+            .map(|request| Self::Http(Box::new(request)))
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// An account purge stopped on a storage error. The error is in the log.
+#[derive(Debug, Error)]
+#[error("account purge failed")]
+pub struct PurgeFailed;
+
+/// Deletes all of the user's memories and devices, then the user item. Deleting rows that are
+/// already gone is not an error, so a purge can run again after a failure.
+pub async fn purge_account(state: &AppState, user_id: &str) -> Result<(), PurgeFailed> {
+    purge(state, user_id).await.map_err(|_| PurgeFailed)
+}
+
+async fn purge(state: &AppState, user_id: &str) -> Result<(), ApiError> {
+    let user = || AttributeValue::S(user_id.to_owned());
+    let memories: Vec<Item> = state
+        .dynamo
+        .query()
+        .table_name(&state.config.memories_table)
+        .key_condition_expression("user_id = :user_id")
+        .expression_attribute_values(":user_id", user())
+        .projection_expression("user_id, memory_id")
+        .into_paginator()
+        .items()
+        .send()
+        .try_collect()
+        .await
+        .map_err(|error| internal(DisplayErrorContext(error)))?;
+    batch_delete(state, &state.config.memories_table, memories).await?;
+    let devices = device_keys(state, user_id).await?;
+    batch_delete(state, &state.config.devices_table, devices).await?;
+    // Last, so a failed purge leaves the user item and its deletion marker behind.
+    state
+        .dynamo
+        .delete_item()
+        .table_name(&state.config.users_table)
+        .key("user_id", user())
+        .send()
+        .await
+        .map_err(|error| internal(DisplayErrorContext(error)))?;
+    Ok(())
+}
+
+/// The table keys of the user's devices.
+async fn device_keys(state: &AppState, user_id: &str) -> Result<Vec<Item>, ApiError> {
+    user_devices(state, user_id)
+        .await?
+        .iter()
+        .map(|item| {
+            let hash = attribute_s(item, "token_hash")?.to_owned();
+            Ok(HashMap::from([(
+                "token_hash".to_owned(),
+                AttributeValue::S(hash),
+            )]))
+        })
+        .collect()
+}
+
+/// Deletes the items with these keys, 25 to a request. One request after the other: about
+/// 2,000 requests for the largest account. Send them concurrently if that becomes too slow.
+async fn batch_delete(state: &AppState, table: &str, keys: Vec<Item>) -> Result<(), ApiError> {
+    let mut requests = keys
+        .into_iter()
+        .map(|key| {
+            let delete = DeleteRequest::builder()
+                .set_key(Some(key))
+                .build()
+                .map_err(internal)?;
+            Ok(WriteRequest::builder().delete_request(delete).build())
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    while !requests.is_empty() {
+        let mut batch: Vec<_> = requests
+            .drain(..requests.len().min(BATCH_WRITE_ITEMS))
+            .collect();
+        let mut backoff = UNPROCESSED_BACKOFF;
+        loop {
+            let unprocessed = state
+                .dynamo
+                .batch_write_item()
+                .request_items(table, batch)
+                .send()
+                .await
+                .map_err(|error| internal(DisplayErrorContext(error)))?
+                .unprocessed_items
+                .and_then(|mut tables| tables.remove(table))
+                .unwrap_or_default();
+            if unprocessed.is_empty() {
+                break;
+            }
+            // DynamoDB returns the writes it could not do now, mostly under throttling.
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(MAX_UNPROCESSED_BACKOFF);
+            batch = unprocessed;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -977,6 +1208,48 @@ mod tests {
             (nothing_complete.next_cursor, nothing_complete.more),
             (3, true)
         );
+    }
+
+    #[test]
+    fn an_invocation_is_a_purge_or_an_http_request() {
+        let purge: Event = serde_json::from_str(r#"{"purge_user_id": "gh:1"}"#).unwrap();
+        assert!(matches!(purge, Event::Purge { user_id } if user_id == "gh:1"));
+
+        let http = serde_json::json!({
+            "version": "2.0",
+            "routeKey": "$default",
+            "rawPath": "/v1/devices",
+            "rawQueryString": "",
+            "headers": {"authorization": "Bearer abc", "host": "api.example.com"},
+            "requestContext": {
+                "accountId": "123456789012",
+                "apiId": "api",
+                "domainName": "api.example.com",
+                "domainPrefix": "api",
+                "http": {
+                    "method": "GET",
+                    "path": "/v1/devices",
+                    "protocol": "HTTP/1.1",
+                    "sourceIp": "192.0.2.1",
+                    "userAgent": "loremaster"
+                },
+                "requestId": "id",
+                "routeKey": "$default",
+                "stage": "$default",
+                "time": "06/Nov/2026:12:00:00 +0000",
+                "timeEpoch": 1793966400000_i64
+            },
+            "isBase64Encoded": false
+        });
+        let http: Event = serde_json::from_str(&http.to_string()).unwrap();
+        assert!(matches!(http, Event::Http(_)));
+
+        for not_an_event in [r#"{"purge_user_id": 1}"#, r#"{"other": "gh:1"}"#, "[]"] {
+            assert!(
+                serde_json::from_str::<Event>(not_an_event).is_err(),
+                "{not_an_event}"
+            );
+        }
     }
 
     #[test]

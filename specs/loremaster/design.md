@@ -225,7 +225,7 @@ sequenceDiagram
 - Why: devices need a shared meeting point to sync through, and the LLM key must stay off devices so users need no API key or extra account (FR19).
 
 ### Design
-API Gateway HTTP API + one Rust Lambda running the whole `axum` router (via `lambda_http`). One binary, one deploy, one IAM role; timeout sized for the LLM endpoints. Shared crate `loremaster-core` for records, HLC, ULID, API types.
+API Gateway HTTP API + one Rust Lambda running the whole `axum` router (via `lambda_http`). One binary, one deploy, one IAM role; `Timeout` 300 s, for the account purge (API Gateway still ends HTTP requests at 30 s). Shared crate `loremaster-core` for records, HLC, ULID, API types.
 
 ### Endpoints
 | Endpoint | In | Out | Errors |
@@ -248,8 +248,12 @@ API Gateway HTTP API + one Rust Lambda running the whole `axum` router (via `lam
 
 ### Account deletion (FR34)
 - `DELETE /v1/account`, one Lambda:
-  - 1. Delete the user's device token items. Auth middleware rejects all devices immediately.
-  - 2. Async-invoke itself to batch-delete remaining DDB rows. Idempotent; Lambda async retries.
+  - 1. Set `deleting = true` on the user item, then delete the user's device token items. Auth middleware rejects all devices immediately. Return 202.
+  - 2. Async-invoke itself with `{"purge_user_id": "<user_id>"}` to batch-delete the `memories` and `devices` rows, then the user item last. Idempotent; Lambda async retries 2 times.
+- The function tells the purge event from an HTTP event by its shape. With no `AWS_LAMBDA_FUNCTION_NAME` (local, tests), step 2 runs inline.
+- While `deleting` is set, `POST /v1/devices` returns 409 `{"error": "account deletion in progress"}` (condition on the user item in the register and replace transactions). After the purge the user item is gone, so signup works again.
+- A purge that fails 3 times leaves the user item with `deleting`. A scan for `deleting` finds it; invoke the purge again by hand (D21).
+- Known gap: `by_user` is eventually consistent. A device registered about 1 s before step 1 keeps a valid token until the purge deletes it, seconds later.
 - No point-in-time recovery, so nothing survives deletion. Local stores untouched.
 
 ---
@@ -263,7 +267,7 @@ API Gateway HTTP API + one Rust Lambda running the whole `axum` router (via `lam
 ### Server: DynamoDB (on-demand, KMS encryption at rest, NFR7)
 | Table | Key | Attributes | Indexes |
 |---|---|---|---|
-| `users` | `user_id` | `next_seq`, `live_count`, `tokens_day`, `tokens_used` | |
+| `users` | `user_id` | `next_seq`, `live_count`, `device_count`, `tokens_day`, `tokens_used`, `deleting` | |
 | `devices` | `token_hash` (SHA-256) | `user_id`, `device_id`, `name`, `created_at` | GSI `user_id` |
 | `memories` | `user_id`, `memory_id` | record fields | LSI `seq`; sparse GSI `user_id` + `evict_key` (`class#created_at`, live rows only) |
 
@@ -368,6 +372,7 @@ sequenceDiagram
 - D18. AWS SAM for infrastructure. Alt: CDK, Terraform. Why: one YAML file for a small fixed serverless stack; no Node, bootstrap or state backend; built-in local emulation.
 - D19. NFR5 met by managed-service SLAs (API Gateway ~99.95%, Lambda ~99.95%, DynamoDB ~99.99%; combined ~99.89%). No alarms or monitoring in P0. Alt: CloudWatch 5xx alarm, synthetic canary. Why: simplest; Anthropic and GitHub outages do not affect sync (turns queue, logins only).
 - D20. Manual `loremaster update` only (download, verify SHA-256, replace binary, restart service). `/v1` stays backward compatible; breaking changes go to `/v2`. Alt: daily auto-update. Why: no self-replacing binary or rollback path; a bad release cannot reach every device unattended.
+- D21. Failed account purges are found by the `deleting` marker and invoked again by hand. Alt: SQS DLQ + alarm. Why: keeps D19 (no alarms) and adds no service; the marker also blocks signup during the purge.
 
 ## P1: Codex CLI
 Moved out of P0. Parked code and fixtures: `p1-codex/`.
