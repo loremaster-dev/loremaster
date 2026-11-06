@@ -107,14 +107,14 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
 - Needs: M1, M2.
 - Design: yes.
 - Features:
-  - F1. Push records: `memories` table and `POST /v1/sync/push` with last-write-wins. Docs: tasks. Needs: M2 F3. Status: not started.
+  - F1. Push records: `memories` table and `POST /v1/sync/push` with last-write-wins. Docs: design, tasks. Needs: M2 F3. Status: not started.
     - Verify (Local):
       - 2 new facts → `applied` has both ids. Each item has a unique `seq`. `live_count` = 2.
       - Same body again → `applied` empty. `seq`, `live_count` unchanged.
       - Same `memory_id`, older `hlc` → not applied, stored item unchanged. Newer `hlc` → applied, higher `seq`.
       - Tombstone for a live record → item keeps only keys, `seq`, `hlc`, `writer`, `deleted`. `live_count` falls by 1.
       - 2 pushes at the same time for one user → all records stored, all `seq` unique.
-      - 100 records → rejected, nothing written (status: OQ3).
+      - 100 records → 400, nothing written.
       - User A and user B push the same `memory_id` → 2 separate items.
   - F2. Pull records: `GET /v1/sync/pull` pages by cursor. Docs: tasks. Needs: F1. Status: not started.
     - Verify (Local):
@@ -302,7 +302,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
 ## Open Questions
 - OQ1. Labeled eval set (20 Claude Code sessions) must exist before M4 F5. Owner: user.
 - OQ2. Design OQ4 (tunables) set during M4 F5.
-- OQ3. Status codes the design does not define: push over 99 records or text over 2,000 chars. Owner: /to-design, by M3 F1. Resolved in M2 F3 design: 401 for a missing, unknown or deleted device token; 404 for another user's device or an unknown device id. Resolved in M2 F4 design: 404 for a `replace_device_id` that is not one of the user's devices.
+- OQ3. Resolved. M2 F3 design: 401 for a missing, unknown or deleted device token; 404 for another user's device or an unknown device id. M2 F4 design: 404 for a `replace_device_id` that is not one of the user's devices. M3 F1 design: 400 for a push of more than 99 records or a bad record (text over 2,000 chars included).
 - OQ4. Test fakes: the design has no way for local tests to replace GitHub (M2) or Haiku (M4). Owner: /to-design M2 F2, /to-design M4 F1.
 - OQ5. Where the Lambda holds the LLM credential, and which API it calls (Anthropic or Bedrock). The design says only that the key stays off devices. Owner: /to-design M4 F1.
 - OQ6. Session with no turns: FR17 says every session produces one episode, and there is nothing to summarize. Owner: /to-brd, by M4 F4.

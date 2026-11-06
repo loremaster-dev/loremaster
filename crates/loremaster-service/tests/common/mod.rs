@@ -8,7 +8,7 @@ use std::time::Duration;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, KeySchemaElement,
-    KeyType, Projection, ProjectionType, ScalarAttributeType,
+    KeyType, LocalSecondaryIndex, Projection, ProjectionType, ScalarAttributeType,
 };
 use axum::Router;
 use axum::body::Body;
@@ -32,6 +32,7 @@ pub struct Service {
     pub dynamo: Client,
     pub users_table: String,
     pub devices_table: String,
+    pub memories_table: String,
 }
 
 impl Service {
@@ -51,12 +52,14 @@ impl Service {
         let suffix = loremaster_core::new_ulid();
         let users_table = format!("users_{suffix}");
         let devices_table = format!("devices_{suffix}");
+        let memories_table = format!("memories_{suffix}");
         if create {
-            create_tables(&dynamo, &users_table, &devices_table).await;
+            create_tables(&dynamo, &users_table, &devices_table, &memories_table).await;
         }
         let config = Config {
             users_table: users_table.clone(),
             devices_table: devices_table.clone(),
+            memories_table: memories_table.clone(),
             github_api_url: fake_github().await,
         };
         Self {
@@ -64,6 +67,7 @@ impl Service {
             dynamo,
             users_table,
             devices_table,
+            memories_table,
         }
     }
 
@@ -82,6 +86,20 @@ impl Service {
     ) -> (StatusCode, serde_json::Value) {
         let body = serde_json::json!({"github_token": github_token, "name": name});
         self.post("/v1/devices", body.to_string()).await
+    }
+
+    pub async fn post_as(
+        &self,
+        path: &str,
+        token: &str,
+        body: impl Into<Body>,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::post(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(body.into())
+            .unwrap();
+        self.send(request).await
     }
 
     pub async fn get(&self, path: &str, token: &str) -> (StatusCode, serde_json::Value) {
@@ -134,7 +152,7 @@ async fn local_dynamo(endpoint: &str) -> Client {
     client
 }
 
-async fn create_tables(dynamo: &Client, users: &str, devices: &str) {
+async fn create_tables(dynamo: &Client, users: &str, devices: &str, memories: &str) {
     let string = |name: &str| {
         AttributeDefinition::builder()
             .attribute_name(name)
@@ -176,6 +194,48 @@ async fn create_tables(dynamo: &Client, users: &str, devices: &str) {
         .attribute_definitions(string("user_id"))
         .key_schema(hash_key("token_hash"))
         .global_secondary_indexes(by_user)
+        .send()
+        .await
+        .unwrap();
+    let by_seq = LocalSecondaryIndex::builder()
+        .index_name("by_seq")
+        .key_schema(hash_key("user_id"))
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("seq")
+                .key_type(KeyType::Range)
+                .build()
+                .unwrap(),
+        )
+        .projection(
+            Projection::builder()
+                .projection_type(ProjectionType::All)
+                .build(),
+        )
+        .build()
+        .unwrap();
+    dynamo
+        .create_table()
+        .table_name(memories)
+        .billing_mode(BillingMode::PayPerRequest)
+        .attribute_definitions(string("user_id"))
+        .attribute_definitions(string("memory_id"))
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("seq")
+                .attribute_type(ScalarAttributeType::N)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(hash_key("user_id"))
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("memory_id")
+                .key_type(KeyType::Range)
+                .build()
+                .unwrap(),
+        )
+        .local_secondary_indexes(by_seq)
         .send()
         .await
         .unwrap();

@@ -59,10 +59,15 @@ create devices \
   --key-schema AttributeName=token_hash,KeyType=HASH \
   --global-secondary-indexes 'IndexName=by_user,KeySchema=[{AttributeName=user_id,KeyType=HASH}],Projection={ProjectionType=ALL}'
 
-echo "DynamoDB Local on $endpoint with tables users and devices"
+create memories \
+  --attribute-definitions AttributeName=user_id,AttributeType=S AttributeName=memory_id,AttributeType=S AttributeName=seq,AttributeType=N \
+  --key-schema AttributeName=user_id,KeyType=HASH AttributeName=memory_id,KeyType=RANGE \
+  --local-secondary-indexes 'IndexName=by_seq,KeySchema=[{AttributeName=user_id,KeyType=HASH},{AttributeName=seq,KeyType=RANGE}],Projection={ProjectionType=ALL}'
+
+echo "DynamoDB Local on $endpoint with tables users, devices and memories"
 
 # Run the service against it, from crates/loremaster-service:
-#   cargo lambda watch --env-var USERS_TABLE=users,DEVICES_TABLE=devices,\
+#   cargo lambda watch --env-var USERS_TABLE=users,DEVICES_TABLE=devices,MEMORIES_TABLE=memories,\
 #   GITHUB_API_URL=https://api.github.com,DYNAMODB_ENDPOINT=http://localhost:8000,\
 #   AWS_ACCESS_KEY_ID=local,AWS_SECRET_ACCESS_KEY=local,AWS_REGION=us-east-2
 # Then call http://localhost:9000/lambda-url/loremaster-service/v1/devices

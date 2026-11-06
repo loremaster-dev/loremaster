@@ -1,6 +1,6 @@
 //! The sync service: one `axum` router that runs in a Lambda behind an HTTP API.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,7 +9,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::DisplayErrorContext;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::types::{
-    AttributeValue, CancellationReason, Delete, Put, TransactWriteItem, Update,
+    AttributeValue, CancellationReason, Delete, KeysAndAttributes, Put, TransactWriteItem, Update,
 };
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Request, State};
@@ -18,7 +18,10 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
-use loremaster_core::{Device, DeviceCredential, DeviceLimitReached, DeviceList, RegisterDevice};
+use loremaster_core::{
+    Device, DeviceCredential, DeviceLimitReached, DeviceList, Hlc, PushRequest, PushResponse,
+    Record, RecordType, RegisterDevice, Scope,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -27,11 +30,14 @@ const MAX_DEVICE_NAME_CHARS: usize = 64;
 const GITHUB_TIMEOUT: Duration = Duration::from_secs(5);
 const DEVICE_LIMIT: u32 = 10;
 const TRANSACTION_TRIES: u32 = 3;
+const MAX_PUSH_RECORDS: usize = 99;
+const MAX_TEXT_CHARS: usize = 2_000;
 
 /// Where the service keeps its data and checks GitHub accounts.
 pub struct Config {
     pub users_table: String,
     pub devices_table: String,
+    pub memories_table: String,
     pub github_api_url: String,
 }
 
@@ -41,12 +47,14 @@ pub struct Config {
 pub struct MissingEnv(&'static str);
 
 impl Config {
-    /// Reads `USERS_TABLE`, `DEVICES_TABLE` and `GITHUB_API_URL` (default `https://api.github.com`).
+    /// Reads `USERS_TABLE`, `DEVICES_TABLE`, `MEMORIES_TABLE` and `GITHUB_API_URL` (default
+    /// `https://api.github.com`).
     pub fn from_env() -> Result<Self, MissingEnv> {
         let required = |name| std::env::var(name).map_err(|_| MissingEnv(name));
         Ok(Self {
             users_table: required("USERS_TABLE")?,
             devices_table: required("DEVICES_TABLE")?,
+            memories_table: required("MEMORIES_TABLE")?,
             github_api_url: std::env::var("GITHUB_API_URL")
                 .unwrap_or_else(|_| "https://api.github.com".to_owned()),
         })
@@ -80,6 +88,7 @@ pub fn router(state: AppState) -> Router {
     let authenticated = Router::new()
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/{id}", delete(delete_device))
+        .route("/v1/sync/push", post(push_records))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
         .route("/v1/devices", post(register_device))
@@ -101,6 +110,8 @@ enum ApiError {
     DeviceNotFound,
     #[error("device limit reached")]
     DeviceLimit(Vec<Device>),
+    #[error("retry")]
+    Conflict,
     #[error("internal error")]
     Internal,
 }
@@ -118,6 +129,7 @@ impl IntoResponse for ApiError {
                 let body = DeviceLimitReached { error, devices };
                 return (StatusCode::CONFLICT, Json(body)).into_response();
             }
+            Self::Conflict => StatusCode::CONFLICT,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(serde_json::json!({ "error": error }))).into_response()
@@ -337,9 +349,12 @@ fn internal(error: impl Display) -> ApiError {
     ApiError::Internal
 }
 
-/// The account that the request's device token belongs to.
+/// The account and device that the request's device token belongs to.
 #[derive(Clone)]
-struct UserId(String);
+struct Caller {
+    user_id: String,
+    device_id: String,
+}
 
 /// Lets a request through only with the bearer token of a device that still exists.
 async fn authenticate(
@@ -367,14 +382,17 @@ async fn authenticate(
         .map_err(|error| internal(DisplayErrorContext(error)))?
         .item
         .ok_or(ApiError::Unauthorized)?;
-    let user_id = attribute_s(&device, "user_id")?.to_owned();
-    request.extensions_mut().insert(UserId(user_id));
+    let caller = Caller {
+        user_id: attribute_s(&device, "user_id")?.to_owned(),
+        device_id: attribute_s(&device, "device_id")?.to_owned(),
+    };
+    request.extensions_mut().insert(caller);
     Ok(next.run(request).await)
 }
 
 async fn list_devices(
     State(state): State<AppState>,
-    Extension(UserId(user_id)): Extension<UserId>,
+    Extension(Caller { user_id, .. }): Extension<Caller>,
 ) -> Result<Json<DeviceList>, ApiError> {
     let devices = sorted_devices(&state, &user_id).await?;
     Ok(Json(DeviceList { devices }))
@@ -393,7 +411,7 @@ async fn sorted_devices(state: &AppState, user_id: &str) -> Result<Vec<Device>, 
 
 async fn delete_device(
     State(state): State<AppState>,
-    Extension(UserId(user_id)): Extension<UserId>,
+    Extension(Caller { user_id, .. }): Extension<Caller>,
     Path(device_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let device = remove_own_device(&state, &user_id, &device_id).await?;
@@ -483,6 +501,289 @@ fn attribute_s<'a>(item: &'a Item, name: &str) -> Result<&'a str, ApiError> {
         .and_then(|value| value.as_s().ok())
         .map(String::as_str)
         .ok_or_else(|| internal(format!("device item has no string {name}")))
+}
+
+/// Stores the records that are newer than the stored versions, each with the user's next `seq`.
+/// The user item's `next_seq` is a condition of the write, so pushes of one user apply one at a
+/// time and a `seq` a reader has seen is never followed by a lower one.
+async fn push_records(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    body: Result<Json<PushRequest>, JsonRejection>,
+) -> Result<Json<PushResponse>, ApiError> {
+    let Json(PushRequest { records }) =
+        body.map_err(|rejection| ApiError::BadRequest(rejection.body_text()))?;
+    check_push(&records, &caller.device_id)?;
+    if records.is_empty() {
+        return Ok(Json(PushResponse {
+            applied: Vec::new(),
+        }));
+    }
+    let next_seq = next_seq(&state, &caller.user_id).await?;
+    let stored = stored_versions(&state, &caller.user_id, &records).await?;
+    let newer: Vec<&Record> = records
+        .iter()
+        .filter(|record| {
+            stored
+                .get(&record.memory_id)
+                .is_none_or(|version| version.hlc < record.hlc)
+        })
+        .collect();
+    if newer.is_empty() {
+        return Ok(Json(PushResponse {
+            applied: Vec::new(),
+        }));
+    }
+    let mut live_delta = 0_i64;
+    let mut items = Vec::with_capacity(newer.len() + 1);
+    for (seq, record) in (next_seq + 1..).zip(&newer) {
+        let read = stored.get(&record.memory_id);
+        let was_live = read.is_some_and(|version| !version.deleted);
+        live_delta += match (was_live, record.deleted) {
+            (false, false) => 1,
+            (true, true) => -1,
+            _ => 0,
+        };
+        items.push(memory_put(&state, &caller.user_id, seq, record, read)?);
+    }
+    let new_next_seq = next_seq + newer.len() as i64;
+    let user = Update::builder()
+        .table_name(&state.config.users_table)
+        .key("user_id", AttributeValue::S(caller.user_id.clone()))
+        .update_expression("SET next_seq = :new, live_count = live_count + :delta")
+        .condition_expression("next_seq = :old")
+        .expression_attribute_values(":old", AttributeValue::N(next_seq.to_string()))
+        .expression_attribute_values(":new", AttributeValue::N(new_next_seq.to_string()))
+        .expression_attribute_values(":delta", AttributeValue::N(live_delta.to_string()))
+        .build()
+        .map_err(internal)?;
+    items.insert(0, TransactWriteItem::builder().update(user).build());
+    match transact(&state, items).await {
+        Ok(()) => Ok(Json(PushResponse {
+            applied: newer
+                .iter()
+                .map(|record| record.memory_id.clone())
+                .collect(),
+        })),
+        // Another push for this user wrote between the reads and this write.
+        Err(TransactError::ConditionFailed(_)) => Err(ApiError::Conflict),
+        Err(TransactError::Storage(error)) => Err(error),
+    }
+}
+
+fn check_push(records: &[Record], device_id: &str) -> Result<(), ApiError> {
+    if records.len() > MAX_PUSH_RECORDS {
+        return Err(ApiError::BadRequest(format!(
+            "a push has at most {MAX_PUSH_RECORDS} records"
+        )));
+    }
+    let mut seen = HashSet::new();
+    for record in records {
+        let reason = if seen.insert(record.memory_id.as_str()) {
+            check_record(record, device_id).err()
+        } else {
+            Some("memory_id appears twice")
+        };
+        if let Some(reason) = reason {
+            return Err(ApiError::BadRequest(format!(
+                "record {}: {reason}",
+                record.memory_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn check_record(record: &Record, device_id: &str) -> Result<(), &'static str> {
+    if !loremaster_core::is_ulid(&record.memory_id) {
+        return Err("memory_id is not a ULID");
+    }
+    let clock = Hlc::parse(&record.hlc).map_err(|_| "hlc does not parse")?;
+    if record.writer != device_id {
+        return Err("writer is not this device");
+    }
+    if clock.writer() != record.writer {
+        return Err("hlc writer is not writer");
+    }
+    if record.deleted {
+        return Ok(());
+    }
+    let text = record.text.as_deref().ok_or("text is missing")?;
+    if !(1..=MAX_TEXT_CHARS).contains(&text.chars().count()) {
+        return Err("text must be 1 to 2,000 characters");
+    }
+    if record.created_at.is_none() {
+        return Err("created_at is missing");
+    }
+    match (record.record_type.ok_or("type is missing")?, record.kind) {
+        (RecordType::Fact, None) => return Err("a fact needs a kind"),
+        (RecordType::Episode, Some(_)) => return Err("an episode has no kind"),
+        _ => {}
+    }
+    match (record.scope.ok_or("scope is missing")?, &record.project_id) {
+        (Scope::Project, None) => Err("project scope needs a project_id"),
+        (Scope::User, Some(_)) => Err("user scope has no project_id"),
+        _ => Ok(()),
+    }
+}
+
+struct StoredVersion {
+    hlc: String,
+    deleted: bool,
+}
+
+/// The stored `hlc` of each pushed memory that the user already has.
+async fn stored_versions(
+    state: &AppState,
+    user_id: &str,
+    records: &[Record],
+) -> Result<HashMap<String, StoredVersion>, ApiError> {
+    let table = &state.config.memories_table;
+    let mut versions = HashMap::new();
+    let mut keys = KeysAndAttributes::builder()
+        .consistent_read(true)
+        .projection_expression("memory_id, hlc, deleted")
+        .set_keys(Some(
+            records
+                .iter()
+                .map(|record| {
+                    HashMap::from([
+                        ("user_id".to_owned(), AttributeValue::S(user_id.to_owned())),
+                        (
+                            "memory_id".to_owned(),
+                            AttributeValue::S(record.memory_id.clone()),
+                        ),
+                    ])
+                })
+                .collect(),
+        ))
+        .build()
+        .map_err(internal)?;
+    loop {
+        let output = state
+            .dynamo
+            .batch_get_item()
+            .request_items(table, keys)
+            .send()
+            .await
+            .map_err(|error| internal(DisplayErrorContext(error)))?;
+        for item in output
+            .responses
+            .and_then(|mut tables| tables.remove(table))
+            .into_iter()
+            .flatten()
+        {
+            let deleted = item
+                .get("deleted")
+                .is_some_and(|value| value.as_bool() == Ok(&true));
+            versions.insert(
+                attribute_s(&item, "memory_id")?.to_owned(),
+                StoredVersion {
+                    hlc: attribute_s(&item, "hlc")?.to_owned(),
+                    deleted,
+                },
+            );
+        }
+        // DynamoDB can return part of a batch; the rest comes back as unprocessed keys.
+        match output
+            .unprocessed_keys
+            .and_then(|mut tables| tables.remove(table))
+        {
+            Some(rest) if !rest.keys().is_empty() => keys = rest,
+            _ => return Ok(versions),
+        }
+    }
+}
+
+async fn next_seq(state: &AppState, user_id: &str) -> Result<i64, ApiError> {
+    let user = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.users_table)
+        .key("user_id", AttributeValue::S(user_id.to_owned()))
+        .consistent_read(true)
+        .projection_expression("next_seq")
+        .send()
+        .await
+        .map_err(|error| internal(DisplayErrorContext(error)))?
+        .item
+        .ok_or_else(|| internal("authenticated user has no user item"))?;
+    user.get("next_seq")
+        .and_then(|value| value.as_n().ok())
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| internal("user item has no valid next_seq"))
+}
+
+/// The stored form of a record. A tombstone keeps only its ids, `seq`, `hlc` and `writer`, so
+/// deleted text leaves the service.
+///
+/// The put only replaces the exact version that `read` saw. A batch read gives no order across
+/// items, so another push can commit between the reads; the live count delta is then wrong, and
+/// this condition fails the push instead of storing it.
+fn memory_put(
+    state: &AppState,
+    user_id: &str,
+    seq: i64,
+    record: &Record,
+    read: Option<&StoredVersion>,
+) -> Result<TransactWriteItem, ApiError> {
+    let s = |value: &str| AttributeValue::S(value.to_owned());
+    let mut item = HashMap::from([
+        ("user_id".to_owned(), s(user_id)),
+        ("memory_id".to_owned(), s(&record.memory_id)),
+        ("seq".to_owned(), AttributeValue::N(seq.to_string())),
+        ("hlc".to_owned(), s(&record.hlc)),
+        ("writer".to_owned(), s(&record.writer)),
+    ]);
+    if record.deleted {
+        item.insert("deleted".to_owned(), AttributeValue::Bool(true));
+    } else {
+        let (Some(record_type), Some(scope), Some(text), Some(created_at)) = (
+            record.record_type,
+            record.scope,
+            &record.text,
+            record.created_at,
+        ) else {
+            return Err(internal("live record passed its checks without content"));
+        };
+        // Cap eviction removes replaced facts first, then episodes, then other facts.
+        let class = match (record_type, &record.superseded_by) {
+            (RecordType::Fact, Some(_)) => 1,
+            (RecordType::Episode, _) => 2,
+            (RecordType::Fact, None) => 3,
+        };
+        item.extend([
+            ("type".to_owned(), s(record_type.as_str())),
+            ("scope".to_owned(), s(scope.as_str())),
+            ("text".to_owned(), s(text)),
+            (
+                "created_at".to_owned(),
+                AttributeValue::N(created_at.to_string()),
+            ),
+            ("evict_key".to_owned(), s(&format!("{class}#{created_at}"))),
+        ]);
+        let optional = [
+            ("kind", record.kind.map(|kind| kind.as_str().to_owned())),
+            ("project_id", record.project_id.clone()),
+            ("superseded_by", record.superseded_by.clone()),
+        ];
+        for (name, value) in optional {
+            if let Some(value) = value {
+                item.insert(name.to_owned(), AttributeValue::S(value));
+            }
+        }
+    }
+    let put = Put::builder()
+        .table_name(&state.config.memories_table)
+        .set_item(Some(item));
+    let put = match read {
+        None => put.condition_expression("attribute_not_exists(memory_id)"),
+        Some(version) => put
+            .condition_expression("hlc = :read_hlc")
+            .expression_attribute_values(":read_hlc", s(&version.hlc)),
+    };
+    let put = put.build().map_err(internal)?;
+    Ok(TransactWriteItem::builder().put(put).build())
 }
 
 #[cfg(test)]
