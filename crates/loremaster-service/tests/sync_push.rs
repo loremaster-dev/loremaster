@@ -4,55 +4,11 @@ mod common;
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use axum::http::StatusCode;
-use common::{ALICE, ALICE_ID, BOB, BOB_ID, Item, Service, string};
-use loremaster_core::{DeviceCredential, PushResponse};
+use common::{
+    ALICE, BOB, BOB_ID, Item, PUSH, Service, alice, device, fact, hlc, push, push_ok, string,
+    tombstone,
+};
 use serde_json::{Value, json};
-
-const PUSH: &str = "/v1/sync/push";
-
-fn alice() -> String {
-    format!("gh:{ALICE_ID}")
-}
-
-async fn device(service: &Service, github_token: &str) -> DeviceCredential {
-    let (status, body) = service.register(github_token, "laptop").await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    serde_json::from_value(body).unwrap()
-}
-
-fn hlc(wall_ms: u64, writer: &str) -> String {
-    format!("{wall_ms:013}-00000-{writer}")
-}
-
-fn fact(memory_id: &str, wall_ms: u64, writer: &str, text: &str) -> Value {
-    json!({
-        "memory_id": memory_id,
-        "hlc": hlc(wall_ms, writer),
-        "writer": writer,
-        "type": "fact",
-        "kind": "preference",
-        "scope": "user",
-        "text": text,
-        "created_at": 1_761_750_000_000_u64,
-    })
-}
-
-fn tombstone(memory_id: &str, wall_ms: u64, writer: &str) -> Value {
-    json!({"memory_id": memory_id, "hlc": hlc(wall_ms, writer), "writer": writer, "deleted": true})
-}
-
-async fn push(service: &Service, token: &str, records: &[Value]) -> (StatusCode, Value) {
-    let body = json!({ "records": records });
-    service.post_as(PUSH, token, body.to_string()).await
-}
-
-async fn push_ok(service: &Service, token: &str, records: &[Value]) -> Vec<String> {
-    let (status, body) = push(service, token, records).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    serde_json::from_value::<PushResponse>(body)
-        .unwrap()
-        .applied
-}
 
 async fn get(service: &Service, table: &str, key: &[(&str, &str)]) -> Option<Item> {
     let mut request = service

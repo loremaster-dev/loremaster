@@ -15,7 +15,9 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::routing::get;
 use http_body_util::BodyExt;
+use loremaster_core::{DeviceCredential, PushResponse};
 use loremaster_service::{AppState, Config, router};
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
 pub const ALICE: &str = "gho_alice";
@@ -280,4 +282,50 @@ async fn fake_github() -> String {
 
 pub fn string(item: &Item, name: &str) -> String {
     item[name].as_s().unwrap().clone()
+}
+
+pub const PUSH: &str = "/v1/sync/push";
+
+pub fn alice() -> String {
+    format!("gh:{ALICE_ID}")
+}
+
+pub async fn device(service: &Service, github_token: &str) -> DeviceCredential {
+    let (status, body) = service.register(github_token, "laptop").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    serde_json::from_value(body).unwrap()
+}
+
+pub fn hlc(wall_ms: u64, writer: &str) -> String {
+    format!("{wall_ms:013}-00000-{writer}")
+}
+
+pub fn fact(memory_id: &str, wall_ms: u64, writer: &str, text: &str) -> Value {
+    json!({
+        "memory_id": memory_id,
+        "hlc": hlc(wall_ms, writer),
+        "writer": writer,
+        "type": "fact",
+        "kind": "preference",
+        "scope": "user",
+        "text": text,
+        "created_at": 1_761_750_000_000_u64,
+    })
+}
+
+pub fn tombstone(memory_id: &str, wall_ms: u64, writer: &str) -> Value {
+    json!({"memory_id": memory_id, "hlc": hlc(wall_ms, writer), "writer": writer, "deleted": true})
+}
+
+pub async fn push(service: &Service, token: &str, records: &[Value]) -> (StatusCode, Value) {
+    let body = json!({ "records": records });
+    service.post_as(PUSH, token, body.to_string()).await
+}
+
+pub async fn push_ok(service: &Service, token: &str, records: &[Value]) -> Vec<String> {
+    let (status, body) = push(service, token, records).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    serde_json::from_value::<PushResponse>(body)
+        .unwrap()
+        .applied
 }

@@ -34,6 +34,9 @@ Resources:
             - Effect: Allow
               Action: [dynamodb:BatchGetItem, dynamodb:PutItem]
               Resource: !GetAtt MemoriesTable.Arn
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource: !Sub "${MemoriesTable.Arn}/index/*"
       Events:
         Api:
           Type: HttpApi

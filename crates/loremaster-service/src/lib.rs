@@ -7,20 +7,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::DisplayErrorContext;
+use aws_sdk_dynamodb::operation::transact_get_items::TransactGetItemsError;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::types::{
-    AttributeValue, CancellationReason, Delete, KeysAndAttributes, Put, TransactWriteItem, Update,
+    AttributeValue, CancellationReason, Delete, Get, KeysAndAttributes, Put, TransactGetItem,
+    TransactWriteItem, Update,
 };
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use loremaster_core::{
-    Device, DeviceCredential, DeviceLimitReached, DeviceList, Hlc, PushRequest, PushResponse,
-    Record, RecordType, RegisterDevice, Scope,
+    Device, DeviceCredential, DeviceLimitReached, DeviceList, Hlc, PullResponse, PushRequest,
+    PushResponse, Record, RecordType, RegisterDevice, Scope,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -89,6 +91,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/{id}", delete(delete_device))
         .route("/v1/sync/push", post(push_records))
+        .route("/v1/sync/pull", get(pull_records))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
         .route("/v1/devices", post(register_device))
@@ -500,7 +503,7 @@ fn attribute_s<'a>(item: &'a Item, name: &str) -> Result<&'a str, ApiError> {
     item.get(name)
         .and_then(|value| value.as_s().ok())
         .map(String::as_str)
-        .ok_or_else(|| internal(format!("device item has no string {name}")))
+        .ok_or_else(|| internal(format!("item has no string {name}")))
 }
 
 /// Stores the records that are newer than the stored versions, each with the user's next `seq`.
@@ -708,10 +711,14 @@ async fn next_seq(state: &AppState, user_id: &str) -> Result<i64, ApiError> {
         .map_err(|error| internal(DisplayErrorContext(error)))?
         .item
         .ok_or_else(|| internal("authenticated user has no user item"))?;
-    user.get("next_seq")
+    user_number(&user, "next_seq")
+}
+
+fn user_number(user: &Item, name: &str) -> Result<i64, ApiError> {
+    user.get(name)
         .and_then(|value| value.as_n().ok())
         .and_then(|value| value.parse().ok())
-        .ok_or_else(|| internal("user item has no valid next_seq"))
+        .ok_or_else(|| internal(format!("user item has no valid {name}")))
 }
 
 /// The stored form of a record. A tombstone keeps only its ids, `seq`, `hlc` and `writer`, so
@@ -786,6 +793,140 @@ fn memory_put(
     Ok(TransactWriteItem::builder().put(put).build())
 }
 
+/// One page of the user's records with a `seq` above the cursor, in `seq` order. The query is
+/// strongly consistent: an eventual read can show a `seq` before a lower one, and a reader whose
+/// cursor moves past the lower one never gets it.
+async fn pull_records(
+    State(state): State<AppState>,
+    Extension(Caller { user_id, .. }): Extension<Caller>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<PullResponse>, ApiError> {
+    let cursor = query
+        .iter()
+        .flat_map(|query| query.split('&'))
+        .find_map(|pair| pair.strip_prefix("cursor="))
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|cursor| *cursor >= 0)
+        .ok_or_else(|| {
+            ApiError::BadRequest("cursor must be a whole number, 0 or more".to_owned())
+        })?;
+    let (next_seq, total) = committed_counters(&state, &user_id).await?;
+    let page = state
+        .dynamo
+        .query()
+        .table_name(&state.config.memories_table)
+        .index_name("by_seq")
+        .key_condition_expression("user_id = :user AND seq > :cursor")
+        .expression_attribute_values(":user", AttributeValue::S(user_id))
+        .expression_attribute_values(":cursor", AttributeValue::N(cursor.to_string()))
+        .consistent_read(true)
+        .send()
+        .await
+        .map_err(|error| internal(DisplayErrorContext(error)))?;
+    let records = page
+        .items()
+        .iter()
+        .map(record_from_item)
+        .collect::<Result<Vec<_>, _>>()?;
+    // The query stops at 1 MB and then gives the key to go on from.
+    let more = page.last_evaluated_key.is_some();
+    Ok(Json(pull_page(records, cursor, next_seq, more, total)))
+}
+
+/// The user's `next_seq` and `live_count`, read serializable against pushes. A query is only
+/// read-committed against a transaction, so it can show part of a push in progress. This read
+/// instead fails while a push on the user item is in progress, so every push up to the
+/// `next_seq` it gives is complete.
+async fn committed_counters(state: &AppState, user_id: &str) -> Result<(i64, i64), ApiError> {
+    let get = Get::builder()
+        .table_name(&state.config.users_table)
+        .key("user_id", AttributeValue::S(user_id.to_owned()))
+        .projection_expression("next_seq, live_count")
+        .build()
+        .map_err(internal)?;
+    let get = TransactGetItem::builder().get(get).build();
+    for _ in 0..TRANSACTION_TRIES {
+        let result = state
+            .dynamo
+            .transact_get_items()
+            .transact_items(get.clone())
+            .send()
+            .await;
+        let error = match result {
+            Ok(output) => {
+                let user = output
+                    .responses()
+                    .first()
+                    .and_then(|response| response.item())
+                    .ok_or_else(|| internal("authenticated user has no user item"))?;
+                return Ok((
+                    user_number(user, "next_seq")?,
+                    user_number(user, "live_count")?,
+                ));
+            }
+            Err(error) => error,
+        };
+        let in_progress = match error.as_service_error() {
+            Some(TransactGetItemsError::TransactionCanceledException(cancelled)) => cancelled
+                .cancellation_reasons()
+                .iter()
+                .any(|reason| reason.code() == Some("TransactionConflict")),
+            _ => false,
+        };
+        if !in_progress {
+            return Err(internal(DisplayErrorContext(error)));
+        }
+    }
+    Err(ApiError::Conflict)
+}
+
+/// Keeps the records up to `next_seq`, which only complete pushes reach. A cut page has more
+/// after it.
+fn pull_page(
+    mut records: Vec<Record>,
+    cursor: i64,
+    next_seq: i64,
+    more: bool,
+    total: i64,
+) -> PullResponse {
+    let complete = records.partition_point(|record| record.seq.is_some_and(|seq| seq <= next_seq));
+    let cut = complete < records.len();
+    records.truncate(complete);
+    PullResponse {
+        next_cursor: records
+            .last()
+            .and_then(|record| record.seq)
+            .unwrap_or(cursor),
+        records,
+        total,
+        more: more || cut,
+    }
+}
+
+/// A stored memory as a record, with every attribute it has.
+fn record_from_item(item: &Item) -> Result<Record, ApiError> {
+    let fields = item
+        .iter()
+        .map(|(name, value)| {
+            let field = match value {
+                AttributeValue::S(text) => serde_json::Value::from(text.as_str()),
+                AttributeValue::N(number) => number
+                    .parse::<i64>()
+                    .map_err(|_| internal(format!("memory item has a bad number {name}")))?
+                    .into(),
+                AttributeValue::Bool(flag) => (*flag).into(),
+                _ => {
+                    return Err(internal(format!(
+                        "memory item has an unknown type of {name}"
+                    )));
+                }
+            };
+            Ok((name.clone(), field))
+        })
+        .collect::<Result<serde_json::Map<_, _>, _>>()?;
+    serde_json::from_value(fields.into()).map_err(internal)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,6 +936,47 @@ mod tests {
             .iter()
             .map(|code| CancellationReason::builder().code(*code).build())
             .collect()
+    }
+
+    fn record_with_seq(seq: i64) -> Record {
+        Record {
+            user_id: None,
+            memory_id: format!("m{seq}"),
+            seq: Some(seq),
+            hlc: "1761750000123-00000-dev_a".to_owned(),
+            writer: "dev_a".to_owned(),
+            record_type: None,
+            kind: None,
+            scope: None,
+            project_id: None,
+            text: None,
+            created_at: None,
+            superseded_by: None,
+            deleted: true,
+            evict_key: None,
+        }
+    }
+
+    #[test]
+    fn a_pull_page_stops_at_the_last_complete_push() {
+        let records = || (4..=7).map(record_with_seq).collect::<Vec<_>>();
+        let seqs = |page: &PullResponse| page.records.iter().map(|r| r.seq).collect::<Vec<_>>();
+
+        let cut = pull_page(records(), 3, 5, false, 9);
+        assert_eq!(seqs(&cut), [Some(4), Some(5)]);
+        assert_eq!((cut.next_cursor, cut.total, cut.more), (5, 9, true));
+
+        let whole = pull_page(records(), 3, 7, false, 9);
+        assert_eq!(whole.records.len(), 4);
+        assert_eq!((whole.next_cursor, whole.more), (7, false));
+        assert!(pull_page(records(), 3, 7, true, 9).more);
+
+        let nothing_complete = pull_page(records(), 3, 3, false, 9);
+        assert!(nothing_complete.records.is_empty());
+        assert_eq!(
+            (nothing_complete.next_cursor, nothing_complete.more),
+            (3, true)
+        );
     }
 
     #[test]
