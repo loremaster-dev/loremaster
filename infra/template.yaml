@@ -25,8 +25,11 @@ Resources:
               Action: dynamodb:UpdateItem
               Resource: !GetAtt UsersTable.Arn
             - Effect: Allow
-              Action: dynamodb:PutItem
+              Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:DeleteItem]
               Resource: !GetAtt DevicesTable.Arn
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource: !Sub "${DevicesTable.Arn}/index/by_user"
       Events:
         Api:
           Type: HttpApi

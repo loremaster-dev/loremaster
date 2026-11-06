@@ -1,4 +1,6 @@
 //! A service wired to DynamoDB Local and a fake GitHub, one set of tables per test.
+// Each test binary uses only some of these helpers.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -18,6 +20,8 @@ use tower::ServiceExt;
 
 pub const ALICE: &str = "gho_alice";
 pub const ALICE_ID: u64 = 1001;
+pub const BOB: &str = "gho_bob";
+pub const BOB_ID: u64 = 1002;
 pub const BROKEN: &str = "gho_broken";
 pub const SLOW: &str = "gho_slow";
 
@@ -80,10 +84,22 @@ impl Service {
         self.post("/v1/devices", body.to_string()).await
     }
 
+    pub async fn get(&self, path: &str, token: &str) -> (StatusCode, serde_json::Value) {
+        self.send(with_bearer(Request::get(path), token)).await
+    }
+
+    pub async fn delete(&self, path: &str, token: &str) -> (StatusCode, serde_json::Value) {
+        self.send(with_bearer(Request::delete(path), token)).await
+    }
+
+    /// The reply status and JSON body. An empty body is `Null`.
     pub async fn send(&self, request: Request<Body>) -> (StatusCode, serde_json::Value) {
         let response = self.router.clone().oneshot(request).await.unwrap();
         let status = response.status();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        if bytes.is_empty() {
+            return (status, serde_json::Value::Null);
+        }
         let body = serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| panic!("reply is not JSON: {}", String::from_utf8_lossy(&bytes)));
         (status, body)
@@ -93,6 +109,13 @@ impl Service {
         let output = self.dynamo.scan().table_name(table).send().await.unwrap();
         output.items.unwrap_or_default()
     }
+}
+
+fn with_bearer(request: axum::http::request::Builder, token: &str) -> Request<Body> {
+    request
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
 }
 
 async fn local_dynamo(endpoint: &str) -> Client {
@@ -169,6 +192,10 @@ async fn fake_github() -> String {
             Some(ALICE) => (
                 StatusCode::OK,
                 format!(r#"{{"id":{ALICE_ID},"login":"alice"}}"#),
+            ),
+            Some(BOB) => (
+                StatusCode::OK,
+                format!(r#"{{"id":{BOB_ID},"login":"bob"}}"#),
             ),
             Some(BROKEN) => (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
             Some(SLOW) => {

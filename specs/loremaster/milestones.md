@@ -73,12 +73,12 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
       - Invalid GitHub token → 401, no item written.
       - `sam deploy --config-env dev` → stack up, same 3 cases pass on HTTPS with a real GitHub token. [approval]
       - `aws dynamodb describe-table` on `users` and `devices` → KMS encryption on, billing on demand. [approval]
-  - F3. Authenticated device management: auth middleware, `GET /v1/devices`, `DELETE /v1/devices/{id}`. Docs: tasks. Needs: F2. Status: not started.
+  - F3. Authenticated device management: auth middleware, `GET /v1/devices`, `DELETE /v1/devices/{id}`. Docs: design, tasks. Needs: F2. Status: done.
     - Verify (Local):
       - Valid token, `GET /v1/devices` → this user's devices only.
-      - No token, or unknown token → rejected (status: OQ3).
+      - No token, or unknown token → 401.
       - `DELETE` own device → 204. That token on the next request → rejected. The user's other token → still works. Device count falls by 1.
-      - User A token, `DELETE` user B's device → B's device remains, B's token works (status: OQ3).
+      - User A token, `DELETE` user B's device → 404. B's device remains, B's token works.
   - F4. Device limit and replace: 11th device refused, one device replaced in a transaction. Docs: tasks. Needs: F3. Status: not started.
     - Verify (Local):
       - 10 devices, 11th `POST /v1/devices` → 409 with the 10 devices. Still 10 in `devices`.
@@ -177,7 +177,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
       - Turn with only pleasantries → `candidates` empty.
       - Turn over 32k tokens → 413, no Haiku call.
       - User over 5M tokens today → 429, no Haiku call.
-      - No device token → rejected (status: OQ3).
+      - No device token → 401.
   - F2. Reconcile endpoint: `POST /v1/reconcile` returns one decision. Docs: tasks. Needs: F1. Status: not started.
     - Verify (Dev stack) [approval]:
       - "Uses pnpm" + neighbour "Uses npm" → SUPERSEDE, neighbour id, text <= 2,000 chars.
@@ -301,7 +301,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
 ## Open Questions
 - OQ1. Labeled eval set (20 Claude Code sessions) must exist before M4 F5. Owner: user.
 - OQ2. Design OQ4 (tunables) set during M4 F5.
-- OQ3. Status codes the design does not define: missing, unknown or deleted device token; acting on another user's device; unknown `replace_device_id`; push over 99 records or text over 2,000 chars. Owner: /to-design, by M2 F3.
+- OQ3. Status codes the design does not define: unknown `replace_device_id`; push over 99 records or text over 2,000 chars. Owner: /to-design, by M2 F4 and M3 F1. Resolved in M2 F3 design: 401 for a missing, unknown or deleted device token; 404 for another user's device or an unknown device id.
 - OQ4. Test fakes: the design has no way for local tests to replace GitHub (M2) or Haiku (M4). Owner: /to-design M2 F2, /to-design M4 F1.
 - OQ5. Where the Lambda holds the LLM credential, and which API it calls (Anthropic or Bedrock). The design says only that the key stays off devices. Owner: /to-design M4 F1.
 - OQ6. Session with no turns: FR17 says every session produces one episode, and there is nothing to summarize. Owner: /to-brd, by M4 F4.
