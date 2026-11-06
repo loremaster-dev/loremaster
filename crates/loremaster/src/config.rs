@@ -82,6 +82,11 @@ impl Paths {
     pub fn logs(&self) -> PathBuf {
         self.home.join("logs")
     }
+
+    /// This device's service credential, readable only by its owner.
+    pub fn credentials(&self) -> PathBuf {
+        self.home.join("credentials")
+    }
 }
 
 /// Creates a directory only its owner can read, with any missing parents. Memories and turns live
@@ -92,6 +97,7 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
 
 #[derive(Default, Deserialize)]
 struct ConfigFile {
+    api_url: Option<String>,
     #[serde(default)]
     redact: RedactSection,
 }
@@ -104,19 +110,27 @@ struct RedactSection {
 
 /// Reads the user's secret patterns. A missing file means none.
 pub fn load_patterns(path: &Path) -> Result<Vec<String>, ConfigError> {
+    Ok(load(path)?.redact.patterns)
+}
+
+/// Reads the sync service URL, if the user set one. A missing file means none.
+pub fn load_api_url(path: &Path) -> Result<Option<String>, ConfigError> {
+    Ok(load(path)?.api_url)
+}
+
+fn load(path: &Path) -> Result<ConfigFile, ConfigError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ConfigFile::default()),
         Err(e) => return Err(e.into()),
     };
-    let file: ConfigFile = toml::from_str(&text).map_err(|e| {
+    toml::from_str(&text).map_err(|e| {
         let start = e.span().map_or(0, |span| span.start);
         ConfigError::ConfigParse {
             line: text[..start].matches('\n').count() + 1,
             message: e.message().to_owned(),
         }
-    })?;
-    Ok(file.redact.patterns)
+    })
 }
 
 #[cfg(test)]
@@ -138,6 +152,7 @@ mod tests {
         assert_eq!(paths.config_toml(), Path::new("/tmp/lm/config.toml"));
         assert_eq!(paths.models(), Path::new("/tmp/lm/models"));
         assert_eq!(paths.logs(), Path::new("/tmp/lm/logs"));
+        assert_eq!(paths.credentials(), Path::new("/tmp/lm/credentials"));
     }
 
     #[test]
@@ -210,6 +225,36 @@ mod tests {
         assert!(matches!(
             patterns_of("[redact]\npatterns = \"x\""),
             Err(ConfigError::ConfigParse { line: 2, .. })
+        ));
+    }
+
+    fn api_url_of(text: &str) -> Result<Option<String>, ConfigError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, text).unwrap();
+        load_api_url(&path)
+    }
+
+    #[test]
+    fn reads_the_api_url_next_to_redact_patterns() {
+        let text = "api_url = \"https://api.example\"\n[redact]\npatterns = [\"x\"]";
+        assert_eq!(
+            api_url_of(text).unwrap().as_deref(),
+            Some("https://api.example")
+        );
+        assert_eq!(patterns_of(text).unwrap(), ["x"]);
+    }
+
+    #[test]
+    fn missing_file_or_key_means_no_api_url() {
+        assert_eq!(
+            load_api_url(Path::new("/nonexistent/config.toml")).unwrap(),
+            None
+        );
+        assert_eq!(api_url_of("[redact]").unwrap(), None);
+        assert!(matches!(
+            api_url_of("api_url = 1"),
+            Err(ConfigError::ConfigParse { line: 1, .. })
         ));
     }
 

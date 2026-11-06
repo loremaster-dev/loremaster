@@ -577,6 +577,7 @@ checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
  "bytes",
+ "form_urlencoded",
  "futures-util",
  "http 1.5.0",
  "http-body 1.1.0",
@@ -592,6 +593,7 @@ dependencies = [
  "serde_core",
  "serde_json",
  "serde_path_to_error",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tower",
@@ -2773,6 +2775,7 @@ name = "loremaster"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
+ "axum",
  "clap",
  "fastembed",
  "gix",
