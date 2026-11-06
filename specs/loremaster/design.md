@@ -191,8 +191,8 @@ sequenceDiagram
   B->>B: apply if hlc newer, embed, dedup
 ```
 
-- Push is one `TransactWriteItems`: user item `next_seq` (condition: unchanged) + each record (condition: absent or older `hlc`). Serializes pushes per user, so a visible `seq` is never followed by a lower one. Conflict: re-read, retry.
-- `live_count` delta from the stored items read before the transaction: new live record +1, live to tombstone -1, else 0. Exact, because a concurrent push changes `next_seq` and forces re-read and retry.
+- Push is one `TransactWriteItems`: user item `next_seq` (condition: unchanged) + each record (condition: still the version read before the transaction, absent or the same `hlc`). Serializes pushes per user, so a visible `seq` is never followed by a lower one. Conflict: 409, nothing written; the client pushes again from its outbox.
+- `live_count` delta from the stored items read before the transaction: new live record +1, live to tombstone -1, else 0. Exact, because a concurrent push changes `next_seq` or a read version, so this push gets 409 and writes nothing.
 - Idempotent: re-pushing the same record is a no-op by HLC.
 - Tombstones kept forever in P0. Offline devices cannot resurrect (FR9). Cleanup job is P1.
 - Tombstones keep only keys, `seq`, `hlc`, `writer`, `deleted`. Text and metadata are removed. See [Appendix A](#appendix-a-dynamodb-memories-table).
@@ -432,7 +432,7 @@ One item per memory: its latest version, or a tombstone.
 | Access | Operation |
 |---|---|
 | Pull | Query LSI: `user_id = :u AND seq > :cursor` |
-| Push | Put with condition `attribute_not_exists(memory_id) OR hlc < :hlc`, in one transaction with `users.next_seq` |
+| Push | Put with condition `attribute_not_exists(memory_id)` or `hlc = :read_hlc` (the version read first), in one transaction with `users.next_seq` |
 | Cap eviction (FR33) | Query GSI: `user_id = :u`, ascending `evict_key` (replaced, then episodes, then facts, oldest first) |
 | Account delete (FR34) | Query `user_id = :u`, batch delete |
 

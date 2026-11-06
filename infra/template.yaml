@@ -19,10 +19,11 @@ Resources:
         Variables:
           USERS_TABLE: !Ref UsersTable
           DEVICES_TABLE: !Ref DevicesTable
+          MEMORIES_TABLE: !Ref MemoriesTable
       Policies:
         - Statement:
             - Effect: Allow
-              Action: dynamodb:UpdateItem
+              Action: [dynamodb:UpdateItem, dynamodb:GetItem]
               Resource: !GetAtt UsersTable.Arn
             - Effect: Allow
               Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:DeleteItem]
@@ -30,6 +31,9 @@ Resources:
             - Effect: Allow
               Action: dynamodb:Query
               Resource: !Sub "${DevicesTable.Arn}/index/by_user"
+            - Effect: Allow
+              Action: [dynamodb:BatchGetItem, dynamodb:PutItem]
+              Resource: !GetAtt MemoriesTable.Arn
       Events:
         Api:
           Type: HttpApi
@@ -66,6 +70,34 @@ Resources:
           KeySchema:
             - AttributeName: user_id
               KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  MemoriesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: memory_id
+          AttributeType: S
+        - AttributeName: seq
+          AttributeType: N
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+        - AttributeName: memory_id
+          KeyType: RANGE
+      LocalSecondaryIndexes:
+        - IndexName: by_seq
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: seq
+              KeyType: RANGE
           Projection:
             ProjectionType: ALL
 

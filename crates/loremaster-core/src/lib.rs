@@ -50,6 +50,11 @@ impl Hlc {
         })
     }
 
+    /// The device, or `server`, that made this stamp.
+    pub fn writer(&self) -> &str {
+        &self.writer
+    }
+
     /// Advances for a local change at wall clock `now_ms` and returns the new stamp.
     pub fn tick(&mut self, now_ms: u64) -> String {
         if now_ms > self.wall_ms {
@@ -73,6 +78,11 @@ impl Hlc {
         }
         Ok(())
     }
+}
+
+/// True for a valid ULID in its 26-character text form.
+pub fn is_ulid(value: &str) -> bool {
+    ulid::Ulid::from_string(value).is_ok()
 }
 
 /// Generates a new time-ordered memory id. Ids made in sequence sort in sequence.
@@ -181,6 +191,19 @@ pub struct Record {
     pub deleted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evict_key: Option<String>,
+}
+
+/// Body of `POST /v1/sync/push`: at most 99 records, each the latest state of one memory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushRequest {
+    pub records: Vec<Record>,
+}
+
+/// Reply to a push: the ids of the records the service stored. A record that is not newer than
+/// the stored one is not in the list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushResponse {
+    pub applied: Vec<String>,
 }
 
 /// Body of `POST /v1/devices`: a GitHub token that proves the account, and a name for the device.
@@ -394,6 +417,52 @@ mod tests {
         assert!(
             serde_json::from_str::<Record>(r#"{"hlc":"1761750000123-00002-w","writer":"w"}"#)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn parsed_clock_names_its_writer() {
+        let clock = Hlc::parse("1761750000123-00002-dev_a1b2").unwrap();
+        assert_eq!(clock.writer(), "dev_a1b2");
+    }
+
+    #[test]
+    fn only_ulid_text_is_a_ulid() {
+        assert!(is_ulid(&new_ulid()));
+        assert!(is_ulid("01JBQ8Z6K4M2T9X0R5N7C3V1HD"));
+        for bad in [
+            "",
+            "not-a-ulid",
+            "01JBQ8Z6K4M2T9X0R5N7C3V1H",
+            "01JBQ8Z6K4M2T9X0R5N7C3V1HDX",
+        ] {
+            assert!(!is_ulid(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn push_bodies_use_the_wire_field_names() {
+        let request: PushRequest = serde_json::from_value(serde_json::json!({
+            "records": [{"memory_id": "01JBQ8Z6K4M2T9X0R5N7C3V1HD", "hlc": "1761750000123-00002-dev_a", "writer": "dev_a", "deleted": true}]
+        }))
+        .unwrap();
+        assert_eq!(request.records.len(), 1);
+        assert!(request.records[0].deleted);
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["records"][0]["memory_id"],
+            "01JBQ8Z6K4M2T9X0R5N7C3V1HD"
+        );
+        let response = PushResponse {
+            applied: vec!["01JBQ8Z6K4M2T9X0R5N7C3V1HD".to_owned()],
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"applied": ["01JBQ8Z6K4M2T9X0R5N7C3V1HD"]})
+        );
+        assert_eq!(
+            serde_json::from_value::<PushResponse>(json).unwrap(),
+            response
         );
     }
 
