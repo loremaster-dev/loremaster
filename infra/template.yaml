@@ -14,7 +14,10 @@ Resources:
       Handler: bootstrap
       Runtime: provided.al2023
       Architectures: [arm64]
-      Timeout: 10
+      # A fixed name, so the function can invoke itself without a circular reference.
+      FunctionName: !Sub "${AWS::StackName}-service"
+      # Long enough to purge the largest account. API Gateway still ends a request at 30 s.
+      Timeout: 300
       Environment:
         Variables:
           USERS_TABLE: !Ref UsersTable
@@ -23,20 +26,35 @@ Resources:
       Policies:
         - Statement:
             - Effect: Allow
-              Action: [dynamodb:UpdateItem, dynamodb:GetItem]
+              Action:
+                - dynamodb:UpdateItem
+                - dynamodb:GetItem
+                - dynamodb:DeleteItem
+                - dynamodb:ConditionCheckItem
               Resource: !GetAtt UsersTable.Arn
             - Effect: Allow
-              Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:DeleteItem]
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:DeleteItem
+                - dynamodb:BatchWriteItem
               Resource: !GetAtt DevicesTable.Arn
             - Effect: Allow
               Action: dynamodb:Query
               Resource: !Sub "${DevicesTable.Arn}/index/by_user"
             - Effect: Allow
-              Action: [dynamodb:BatchGetItem, dynamodb:PutItem]
+              Action:
+                - dynamodb:BatchGetItem
+                - dynamodb:PutItem
+                - dynamodb:Query
+                - dynamodb:BatchWriteItem
               Resource: !GetAtt MemoriesTable.Arn
             - Effect: Allow
               Action: dynamodb:Query
               Resource: !Sub "${MemoriesTable.Arn}/index/*"
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-service"
       Events:
         Api:
           Type: HttpApi

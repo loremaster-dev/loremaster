@@ -66,8 +66,11 @@ create memories \
 
 echo "DynamoDB Local on $endpoint with tables users, devices and memories"
 
-# Run the service against it, from crates/loremaster-service:
-#   cargo lambda watch --env-var USERS_TABLE=users,DEVICES_TABLE=devices,MEMORIES_TABLE=memories,\
+# Run the service against it, from crates/loremaster-service. A second instance runs the account
+# purge that `DELETE /v1/account` sends to the function itself:
+#   cargo lambda watch --concurrency 2 \
+#   --env-var USERS_TABLE=users,DEVICES_TABLE=devices,MEMORIES_TABLE=memories,\
 #   GITHUB_API_URL=https://api.github.com,DYNAMODB_ENDPOINT=http://localhost:8000,\
+#   LAMBDA_ENDPOINT=http://localhost:9000,\
 #   AWS_ACCESS_KEY_ID=local,AWS_SECRET_ACCESS_KEY=local,AWS_REGION=us-east-2
 # Then call http://localhost:9000/lambda-url/loremaster-service/v1/devices
