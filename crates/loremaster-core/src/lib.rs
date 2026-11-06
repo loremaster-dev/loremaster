@@ -197,6 +197,20 @@ pub struct DeviceCredential {
     pub token: String,
 }
 
+/// One registered device, as `GET /v1/devices` shows it. `created_at` is epoch milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Device {
+    pub device_id: String,
+    pub name: String,
+    pub created_at: u64,
+}
+
+/// Reply to `GET /v1/devices`: the user's devices, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceList {
+    pub devices: Vec<Device>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +414,22 @@ mod tests {
             serde_json::from_value::<DeviceCredential>(json).unwrap(),
             credential
         );
+        let list = DeviceList {
+            devices: vec![Device {
+                device_id: "dev_01JBQ8Z6K4M2T9X0R5N7C3V1HD".to_owned(),
+                name: "laptop".to_owned(),
+                created_at: 1_761_750_000_123,
+            }],
+        };
+        let json = serde_json::to_value(&list).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"devices": [{
+                "device_id": "dev_01JBQ8Z6K4M2T9X0R5N7C3V1HD",
+                "name": "laptop",
+                "created_at": 1_761_750_000_123_u64,
+            }]})
+        );
+        assert_eq!(serde_json::from_value::<DeviceList>(json).unwrap(), list);
     }
 }
