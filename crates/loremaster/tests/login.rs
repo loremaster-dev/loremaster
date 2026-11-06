@@ -223,6 +223,10 @@ fn login_saves_a_private_credential() {
         stdout.contains("Open https://github.com/login/device and enter code ABCD-1234"),
         "{stdout}"
     );
+    assert!(
+        stdout.contains("After you approve, check this terminal for the result."),
+        "{stdout}"
+    );
     assert!(stdout.contains("(dev_new)"), "{stdout}");
 
     assert_eq!(

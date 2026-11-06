@@ -201,6 +201,11 @@ fn github_login(http: &Http, github_url: &str, out: &mut impl Write) -> Result<S
         "Open {} and enter code {}",
         code.verification_uri, code.user_code
     )?;
+    // GitHub can show an error page after an approval that worked, so point to the real result.
+    writeln!(
+        out,
+        "After you approve, check this terminal for the result."
+    )?;
     out.flush()?;
     let deadline = Instant::now() + Duration::from_secs(code.expires_in);
     let mut interval = Duration::from_secs(code.interval);
