@@ -56,7 +56,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
 - Builds: SAM template (`infra/template.yaml`, dev and prod envs), GitHub OAuth App (device flow), `POST /v1/devices`, `GET /v1/devices`, `DELETE /v1/devices/{id}`, auth middleware, DDB `users`, `devices`, `loremaster login`, `api_url` config, API types in `loremaster-core`.
 - Covers: FR12, FR13 (slot freed on the server), NFR6 (DDB), NFR7.
 - Exit criteria:
-  - Login from a headless Linux box via URL + code.
+  - Login with no browser on the machine, via URL + code. The headless Linux check over SSH is in M5 F1.
   - 11th device refused with the list of current devices; replacing one succeeds and the replaced token is rejected on the next request (FR12).
   - Deleted device token rejected on the next request.
   - Token for user A cannot read or write user B (NFR7).
@@ -84,13 +84,13 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
       - 10 devices, 11th `POST /v1/devices` → 409 with the 10 devices. Still 10 in `devices`.
       - Same request with `replace_device_id` → `{device_id, token}`. Replaced token on the next request → rejected. Still 10 devices.
       - `replace_device_id` of another user's device → 404. That device remains, no device created.
-  - F5. `loremaster login`: device flow in the CLI, token saved. Docs: tasks. Needs: F4. Status: not started.
+  - F5. `loremaster login`: device flow in the CLI, token saved. Docs: design, tasks. Needs: F4. Status: done.
     - Verify:
-      - `loremaster login` against the Dev stack, over SSH with no browser on the box → prints URL + user code. After approval in a browser elsewhere, `~/.loremaster/credentials` exists with mode 0600, and the token passes `GET /v1/devices`. [manual] [approval]
+      - `loremaster login` against the Dev stack, from a shell with no browser → prints URL + user code. After approval in a browser on another device, `~/.loremaster/credentials` exists with mode 0600, and the token passes `GET /v1/devices`. [manual] [approval]
       - GitHub token after login → not in `credentials`, `config.toml` or the output. [manual] [approval]
       - `api_url` in `config.toml` → the CLI calls that URL.
       - Account at 10 devices → CLI lists the 10 and asks which to replace. After a choice, login succeeds and the replaced token is rejected. [manual] [approval]
-- Status: in progress.
+- Status: done.
 
 ## M3. Sync
 - Delivers: memories converge across a user's devices, offline and in parallel. New device bootstraps with progress. Tested with seeded and manually written records; no extraction needed.
@@ -235,6 +235,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
   - F2. `loremaster setup`: login, service unit, agent detection, hooks, bootstrap progress. Docs: tasks. Needs: F1, M3 F6. Status: not started.
     - Verify:
       - Fresh macOS and fresh Linux, install command + setup + browser login → within 5 min, a Claude Code turn appears in `turn_queue`. [manual] [approval]
+      - `loremaster login` on a headless Linux machine over SSH → prints URL + user code, and login succeeds after approval on another device. [manual] [approval]
       - Service unit → launchd agent on macOS, systemd user unit on Linux. Service restarts after a reboot. [manual]
       - Existing `~/.claude/settings.json` entries → kept. Our entries added once, also on a second run.
       - No Claude Code on the device → setup finishes, no hooks written. Install Claude Code, `loremaster enable claude-code` → next session's recall probe returns existing memory.
@@ -308,6 +309,6 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
 - OQ7. Uninstall with the service unreachable: FR13 requires the slot freed, and the design does not define this path. Owner: /to-design, by M5 F3.
 - OQ8. Prerequisites. Owner: user.
   - By M2 F2: AWS account, `aws`, `sam`, `cargo-lambda`, DynamoDB Local, GitHub OAuth App. The 3 tools are not on the dev Mac today.
-  - By M2 F5: a headless Linux box.
+  - By M5 F1: a headless Linux machine with SSH.
   - By M3 F6: a 5-year-old laptop on 50 Mbps.
   - By M4 F1: LLM credential.
