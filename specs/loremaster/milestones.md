@@ -107,7 +107,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
 - Needs: M1, M2.
 - Design: yes.
 - Features:
-  - F1. Push records: `memories` table and `POST /v1/sync/push` with last-write-wins. Docs: design, tasks. Needs: M2 F3. Status: not started.
+  - F1. Push records: `memories` table and `POST /v1/sync/push` with last-write-wins. Docs: design, tasks. Needs: M2 F3. Status: done.
     - Verify (Local):
       - 2 new facts → `applied` has both ids. Each item has a unique `seq`. `live_count` = 2.
       - Same body again → `applied` empty. `seq`, `live_count` unchanged.
@@ -116,7 +116,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
       - 2 pushes at the same time for one user → all records stored, all `seq` unique.
       - 100 records → 400, nothing written.
       - User A and user B push the same `memory_id` → 2 separate items.
-  - F2. Pull records: `GET /v1/sync/pull` pages by cursor. Docs: tasks. Needs: F1. Status: not started.
+  - F2. Pull records: `GET /v1/sync/pull` pages by cursor. Docs: design, tasks. Needs: F1. Status: not started.
     - Verify (Local):
       - 3 stored, `cursor=0` → 3 records in `seq` order, `total` = 3, `more` false.
       - `cursor=<next_cursor>` → no records, `more` false.
