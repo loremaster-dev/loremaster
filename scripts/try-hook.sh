@@ -22,8 +22,8 @@ db="$LOREMASTER_HOME/store.db"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-queued() {
-    sqlite3 "$db" 'SELECT count(*) FROM turn_queue'
+last_queued() {
+    sqlite3 "$db" 'SELECT coalesce(max(id), 0) FROM turn_queue'
 }
 
 agent=claude-code
@@ -33,11 +33,15 @@ run_dir="$work/$agent"
 mkdir -p "$run_dir"
 cp "$fixtures/transcript.jsonl" "$run_dir/transcript.jsonl"
 session="try-hook-$$-$agent"
+size=$(wc -c <"$run_dir/transcript.jsonl" | tr -d ' ')
+offset() {
+    sqlite3 "$db" "SELECT transcript_offset FROM sessions WHERE session_id = '$session'"
+}
 for pair in SessionStart:session_start UserPromptSubmit:user_prompt_submit Stop:stop SessionEnd:session_end; do
     event=${pair%%:*}
     file=${pair##*:}
     echo "== $agent $event"
-    before=$(queued)
+    before=$(last_queued)
     output=$(sed -e "s|__FIXTURE_DIR__|$run_dir|" \
         -e "s|\"session_id\": \"[^\"]*\"|\"session_id\": \"$session\"|" \
         "$fixtures/$file.json" | "$loremaster" hook "$agent" "$event")
@@ -46,18 +50,18 @@ for pair in SessionStart:session_start UserPromptSubmit:user_prompt_submit Stop:
     else
         echo "(no output)"
     fi
-    # Capture happens just after the reply.
-    after=$(queued)
+    # Capture happens just after the reply, one commit per turn. The offset reaches the end of the
+    # transcript with the last commit.
     if [ "$event" = Stop ]; then
         waited=0
-        while [ "$after" -eq "$before" ] && [ "$waited" -lt 300 ]; do
+        while [ "$(offset)" != "$size" ] && [ "$waited" -lt 300 ]; do
             sleep 0.1
             waited=$((waited + 1))
-            after=$(queued)
         done
     fi
-    if [ "$after" -gt "$before" ]; then
-        echo "turn_queue +$((after - before)):"
-        sqlite3 "$db" "SELECT turn FROM turn_queue WHERE id > (SELECT max(id) - $((after - before)) FROM turn_queue) ORDER BY id"
+    added=$(sqlite3 "$db" "SELECT count(*) FROM turn_queue WHERE id > $before")
+    if [ "$added" -gt 0 ]; then
+        echo "turn_queue +$added:"
+        sqlite3 "$db" "SELECT turn FROM turn_queue WHERE id > $before ORDER BY id"
     fi
 done
