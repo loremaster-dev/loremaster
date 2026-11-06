@@ -184,10 +184,13 @@ pub struct Record {
 }
 
 /// Body of `POST /v1/devices`: a GitHub token that proves the account, and a name for the device.
+/// `replace_device_id` names one of the account's devices to remove in the same step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterDevice {
     pub github_token: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_device_id: Option<String>,
 }
 
 /// Reply to a device registration. `token` is shown once; the service keeps only its hash.
@@ -208,6 +211,14 @@ pub struct Device {
 /// Reply to `GET /v1/devices`: the user's devices, oldest first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceList {
+    pub devices: Vec<Device>,
+}
+
+/// The 409 reply to `POST /v1/devices` when the account has no free device slot: its devices,
+/// oldest first, so the caller can choose one to replace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceLimitReached {
+    pub error: String,
     pub devices: Vec<Device>,
 }
 
@@ -395,6 +406,7 @@ mod tests {
             RegisterDevice {
                 github_token: "gho_x".to_owned(),
                 name: "laptop".to_owned(),
+                replace_device_id: None,
             }
         );
         assert_eq!(
@@ -431,5 +443,39 @@ mod tests {
             }]})
         );
         assert_eq!(serde_json::from_value::<DeviceList>(json).unwrap(), list);
+
+        let replace = RegisterDevice {
+            replace_device_id: Some("dev_01JBQ8Z6K4M2T9X0R5N7C3V1HD".to_owned()),
+            ..request
+        };
+        let json = serde_json::to_value(&replace).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "github_token": "gho_x",
+                "name": "laptop",
+                "replace_device_id": "dev_01JBQ8Z6K4M2T9X0R5N7C3V1HD",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<RegisterDevice>(json).unwrap(),
+            replace
+        );
+
+        let limit = DeviceLimitReached {
+            error: "device limit reached".to_owned(),
+            devices: list.devices,
+        };
+        let json = serde_json::to_value(&limit).unwrap();
+        assert_eq!(json["error"], "device limit reached");
+        assert_eq!(
+            json["devices"][0]["device_id"],
+            "dev_01JBQ8Z6K4M2T9X0R5N7C3V1HD"
+        );
+        assert_eq!(json.as_object().unwrap().len(), 2);
+        assert_eq!(
+            serde_json::from_value::<DeviceLimitReached>(json).unwrap(),
+            limit
+        );
     }
 }

@@ -79,11 +79,11 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
       - No token, or unknown token → 401.
       - `DELETE` own device → 204. That token on the next request → rejected. The user's other token → still works. Device count falls by 1.
       - User A token, `DELETE` user B's device → 404. B's device remains, B's token works.
-  - F4. Device limit and replace: 11th device refused, one device replaced in a transaction. Docs: tasks. Needs: F3. Status: not started.
+  - F4. Device limit and replace: 11th device refused, one device replaced in a transaction. Docs: design, tasks. Needs: F3. Status: done.
     - Verify (Local):
       - 10 devices, 11th `POST /v1/devices` → 409 with the 10 devices. Still 10 in `devices`.
       - Same request with `replace_device_id` → `{device_id, token}`. Replaced token on the next request → rejected. Still 10 devices.
-      - `replace_device_id` of another user's device → that device remains, no device created (status: OQ3).
+      - `replace_device_id` of another user's device → 404. That device remains, no device created.
   - F5. `loremaster login`: device flow in the CLI, token saved. Docs: tasks. Needs: F4. Status: not started.
     - Verify:
       - `loremaster login` against the Dev stack, over SSH with no browser on the box → prints URL + user code. After approval in a browser elsewhere, `~/.loremaster/credentials` exists with mode 0600, and the token passes `GET /v1/devices`. [manual] [approval]
@@ -301,7 +301,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
 ## Open Questions
 - OQ1. Labeled eval set (20 Claude Code sessions) must exist before M4 F5. Owner: user.
 - OQ2. Design OQ4 (tunables) set during M4 F5.
-- OQ3. Status codes the design does not define: unknown `replace_device_id`; push over 99 records or text over 2,000 chars. Owner: /to-design, by M2 F4 and M3 F1. Resolved in M2 F3 design: 401 for a missing, unknown or deleted device token; 404 for another user's device or an unknown device id.
+- OQ3. Status codes the design does not define: push over 99 records or text over 2,000 chars. Owner: /to-design, by M3 F1. Resolved in M2 F3 design: 401 for a missing, unknown or deleted device token; 404 for another user's device or an unknown device id. Resolved in M2 F4 design: 404 for a `replace_device_id` that is not one of the user's devices.
 - OQ4. Test fakes: the design has no way for local tests to replace GitHub (M2) or Haiku (M4). Owner: /to-design M2 F2, /to-design M4 F1.
 - OQ5. Where the Lambda holds the LLM credential, and which API it calls (Anthropic or Bedrock). The design says only that the key stays off devices. Owner: /to-design M4 F1.
 - OQ6. Session with no turns: FR17 says every session produces one episode, and there is nothing to summarize. Owner: /to-brd, by M4 F4.
