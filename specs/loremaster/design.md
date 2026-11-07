@@ -252,6 +252,7 @@ API Gateway HTTP API + one Rust Lambda running the whole `axum` router (via `lam
   - 2. Async-invoke itself with `{"purge_user_id": "<user_id>"}` to batch-delete the `memories` and `devices` rows, then the user item last. Idempotent; Lambda async retries 2 times.
 - The function tells the purge event from an HTTP event by its shape. With no `AWS_LAMBDA_FUNCTION_NAME` (local, tests), step 2 runs inline.
 - While `deleting` is set, `POST /v1/devices` returns 409 `{"error": "account deletion in progress"}` (condition on the user item in the register and replace transactions). After the purge the user item is gone, so signup works again.
+- While `deleting` is set, `POST /v1/sync/push` returns its usual 409 and writes nothing (condition on the user item in the push transaction). So no record lands after the purge reads the user's memories. The purge reads them with a consistent read, one page at a time.
 - A purge that fails 3 times leaves the user item with `deleting`. A scan for `deleting` finds it; invoke the purge again by hand (D21).
 - Known gap: `by_user` is eventually consistent. A device registered about 1 s before step 1 keeps a valid token until the purge deletes it, seconds later.
 - No point-in-time recovery, so nothing survives deletion. Local stores untouched.

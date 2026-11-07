@@ -1074,20 +1074,27 @@ pub async fn purge_account(state: &AppState, user_id: &str) -> Result<(), PurgeF
 
 async fn purge(state: &AppState, user_id: &str) -> Result<(), ApiError> {
     let user = || AttributeValue::S(user_id.to_owned());
-    let memories: Vec<Item> = state
+    // A consistent read, so a push that committed just before the deletion marker is not missed.
+    // One page at a time, so the largest account does not hold all its keys in memory.
+    let mut pages = state
         .dynamo
         .query()
         .table_name(&state.config.memories_table)
         .key_condition_expression("user_id = :user_id")
         .expression_attribute_values(":user_id", user())
         .projection_expression("user_id, memory_id")
+        .consistent_read(true)
         .into_paginator()
-        .items()
-        .send()
-        .try_collect()
-        .await
-        .map_err(|error| internal(DisplayErrorContext(error)))?;
-    batch_delete(state, &state.config.memories_table, memories).await?;
+        .send();
+    while let Some(page) = pages.next().await {
+        let page = page.map_err(|error| internal(DisplayErrorContext(error)))?;
+        batch_delete(
+            state,
+            &state.config.memories_table,
+            page.items.unwrap_or_default(),
+        )
+        .await?;
+    }
     let devices = device_keys(state, user_id).await?;
     batch_delete(state, &state.config.devices_table, devices).await?;
     // Last, so a failed purge leaves the user item and its deletion marker behind.
