@@ -4,8 +4,11 @@ use std::fs::File;
 use std::path::Path;
 use std::time::Duration;
 
-use loremaster_core::{Kind, Record, RecordType, Scope};
-use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, params};
+use loremaster_core::{Hlc, Kind, Record, RecordType, Scope};
+use rusqlite::{
+    CachedStatement, Connection, ErrorCode, OptionalExtension, Row, Transaction,
+    TransactionBehavior, params,
+};
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
@@ -56,6 +59,9 @@ const SCHEMA_V1: &str = "
 ";
 const MEMORY_COLUMNS: &str = "memory_id, type, kind, scope, project_id, text, created_at, hlc, \
     writer, superseded_by, deleted, seq, vector, model_id";
+const MEMORY_VALUES: &str = "?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14";
+const CLOCK_KEY: &str = "hlc";
+const CURSOR_KEY: &str = "cursor";
 
 /// Why the store could not be opened or used.
 #[derive(Debug, Error)]
@@ -150,34 +156,172 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut insert = tx.prepare_cached(&format!(
-                "INSERT OR REPLACE INTO memories ({MEMORY_COLUMNS}) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+                "INSERT OR REPLACE INTO memories ({MEMORY_COLUMNS}) VALUES ({MEMORY_VALUES})"
             ))?;
-            for StoredMemory {
-                record,
-                vector,
-                model_id,
-            } in memories
-            {
-                insert.execute(params![
-                    record.memory_id,
-                    record.record_type.map(RecordType::as_str),
-                    record.kind.map(Kind::as_str),
-                    record.scope.map(Scope::as_str),
-                    record.project_id,
-                    record.text,
-                    record.created_at,
-                    record.hlc,
-                    record.writer,
-                    record.superseded_by,
-                    record.deleted,
-                    record.seq,
-                    vector.as_deref().map(vector_bytes),
-                    model_id,
-                ])?;
+            for memory in memories {
+                execute_with_memory(&mut insert, memory)?;
             }
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Stores memories written on this device and queues them for push, in one transaction. Each
+    /// gets `writer`, and an empty `hlc` gets the next stamp of the device clock. A given `hlc` is
+    /// kept, and the clock moves past it.
+    pub fn write_local(
+        &self,
+        memories: &mut [StoredMemory],
+        writer: &str,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        // Immediate: the clock is read, then written, and another process may write it too.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let mut clock = read_clock(&tx, writer)?;
+        {
+            let mut insert = tx.prepare_cached(&format!(
+                "INSERT OR REPLACE INTO memories ({MEMORY_COLUMNS}) VALUES ({MEMORY_VALUES})"
+            ))?;
+            // A row already queued keeps its place, so the oldest change is pushed first.
+            let mut queue =
+                tx.prepare_cached("INSERT OR IGNORE INTO outbox (memory_id) VALUES (?1)")?;
+            for memory in memories.iter_mut() {
+                let record = &mut memory.record;
+                if record.hlc.is_empty() {
+                    record.hlc = clock.tick(now_ms.max(0) as u64);
+                } else {
+                    observe(&mut clock, &record.hlc);
+                }
+                record.writer = writer.to_owned();
+                execute_with_memory(&mut insert, memory)?;
+                queue.execute([&memory.record.memory_id])?;
+            }
+        }
+        save_state(&tx, CLOCK_KEY, &clock.to_string())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Stores each pulled memory whose `hlc` is newer than the local copy, the cursor after the
+    /// page, and the device clock moved past every stamp in it, in one transaction. Returns the
+    /// memories it stored.
+    pub fn apply_pulled(
+        &self,
+        memories: Vec<StoredMemory>,
+        cursor: i64,
+        writer: &str,
+    ) -> Result<Vec<StoredMemory>, StoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let mut clock = read_clock(&tx, writer)?;
+        let mut stored = Vec::with_capacity(memories.len());
+        {
+            let mut upsert = tx.prepare_cached(&format!(
+                "INSERT INTO memories ({MEMORY_COLUMNS}) VALUES ({MEMORY_VALUES})
+                 ON CONFLICT (memory_id) DO UPDATE SET
+                     type = excluded.type, kind = excluded.kind, scope = excluded.scope,
+                     project_id = excluded.project_id, text = excluded.text,
+                     created_at = excluded.created_at, hlc = excluded.hlc,
+                     writer = excluded.writer, superseded_by = excluded.superseded_by,
+                     deleted = excluded.deleted, seq = excluded.seq, vector = excluded.vector,
+                     model_id = excluded.model_id
+                 WHERE excluded.hlc > memories.hlc"
+            ))?;
+            for memory in memories {
+                observe(&mut clock, &memory.record.hlc);
+                if execute_with_memory(&mut upsert, &memory)? == 1 {
+                    stored.push(memory);
+                }
+            }
+        }
+        save_state(&tx, CURSOR_KEY, &cursor.to_string())?;
+        save_state(&tx, CLOCK_KEY, &clock.to_string())?;
+        tx.commit()?;
+        Ok(stored)
+    }
+
+    /// Reads the `hlc` of a memory, if the device has it.
+    pub fn hlc_of(&self, memory_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT hlc FROM memories WHERE memory_id = ?1",
+                [memory_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Sets the vector of a memory, unless it has changed since `hlc`. True when it was set.
+    pub fn set_vector(
+        &self,
+        memory_id: &str,
+        hlc: &str,
+        vector: &[f32],
+        model_id: &str,
+    ) -> Result<bool, StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE memories SET vector = ?3, model_id = ?4 WHERE memory_id = ?1 AND hlc = ?2",
+            params![memory_id, hlc, vector_bytes(vector), model_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The `next_cursor` of the last pulled page, or 0 before the first pull.
+    pub fn sync_cursor(&self) -> Result<i64, StoreError> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM sync_state WHERE key = ?1",
+                [CURSOR_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.and_then(|v| v.parse().ok()).unwrap_or(0))
+    }
+
+    /// Number of memories waiting to be pushed.
+    pub fn outbox_count(&self) -> Result<i64, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT count(*) FROM outbox", [], |row| row.get(0))?)
+    }
+
+    /// Reads up to `limit` memories waiting to be pushed, oldest first. Queued ids with no memory
+    /// are removed.
+    pub fn outbox_batch(&self, limit: usize) -> Result<Vec<StoredMemory>, StoreError> {
+        self.conn.execute(
+            "DELETE FROM outbox WHERE memory_id NOT IN (SELECT memory_id FROM memories)",
+            [],
+        )?;
+        let mut query = self.conn.prepare_cached(&format!(
+            "SELECT {MEMORY_COLUMNS} FROM outbox JOIN memories USING (memory_id)
+             ORDER BY outbox.rowid LIMIT ?1"
+        ))?;
+        let rows = query.query_map([limit as i64], memory_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Takes pushed memories out of the outbox. A memory changed since its push keeps its row, so
+    /// the change is pushed next time.
+    pub fn remove_pushed(&self, pushed: &[(&str, &str)]) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut delete = tx.prepare_cached(
+                "DELETE FROM outbox WHERE memory_id = ?1
+                     AND EXISTS (SELECT 1 FROM memories WHERE memory_id = ?1 AND hlc = ?2)",
+            )?;
+            for (memory_id, hlc) in pushed {
+                delete.execute([memory_id, hlc])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Takes a memory out of the outbox whatever its state, such as one the service refuses.
+    pub fn remove_from_outbox(&self, memory_id: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute("DELETE FROM outbox WHERE memory_id = ?1", [memory_id])?;
         Ok(())
     }
 
@@ -346,6 +490,64 @@ impl Store {
             .conn
             .query_row("PRAGMA data_version", [], |row| row.get(0))?)
     }
+}
+
+fn execute_with_memory(
+    statement: &mut CachedStatement<'_>,
+    memory: &StoredMemory,
+) -> rusqlite::Result<usize> {
+    let StoredMemory {
+        record,
+        vector,
+        model_id,
+    } = memory;
+    statement.execute(params![
+        record.memory_id,
+        record.record_type.map(RecordType::as_str),
+        record.kind.map(Kind::as_str),
+        record.scope.map(Scope::as_str),
+        record.project_id,
+        record.text,
+        record.created_at,
+        record.hlc,
+        record.writer,
+        record.superseded_by,
+        record.deleted,
+        record.seq,
+        vector.as_deref().map(vector_bytes),
+        model_id,
+    ])
+}
+
+/// The device clock for `writer`, moved past the last stamp this device saved.
+fn read_clock(conn: &Connection, writer: &str) -> Result<Hlc, StoreError> {
+    let mut clock = Hlc::new(writer);
+    let saved: Option<String> = conn
+        .query_row(
+            "SELECT value FROM sync_state WHERE key = ?1",
+            [CLOCK_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(saved) = saved {
+        observe(&mut clock, &saved);
+    }
+    Ok(clock)
+}
+
+/// Moves the clock past a stamp. A malformed one cannot order anything, so it is skipped.
+fn observe(clock: &mut Hlc, stamp: &str) {
+    if let Err(e) = clock.observe(stamp) {
+        tracing::warn!(error = %e, "clock skipped a stamp");
+    }
+}
+
+fn save_state(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_state (key, value) VALUES (?1, ?2)",
+        [key, value],
+    )?;
+    Ok(())
 }
 
 fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
@@ -832,6 +1034,20 @@ mod tests {
             now_ms: 1,
         };
         assert!(store.commit_turn(turn).is_err());
+        assert!(store.write_local(&mut [fact("m1")], "w", 1).is_err());
+        assert!(store.apply_pulled(vec![fact("m1")], 1, "w").is_err());
+        assert!(store.hlc_of("m1").is_err());
+        assert!(store.set_vector("m1", "h", &[1.0], "m").is_err());
+        assert!(store.outbox_batch(1).is_err());
+        assert!(store.remove_pushed(&[("m1", "h")]).is_err());
+
+        store
+            .conn
+            .execute_batch("DROP TABLE outbox; DROP TABLE sync_state;")
+            .unwrap();
+        assert!(store.sync_cursor().is_err());
+        assert!(store.outbox_count().is_err());
+        assert!(store.remove_from_outbox("m1").is_err());
     }
 
     #[test]
@@ -853,5 +1069,219 @@ mod tests {
         let before = store.data_version().unwrap();
         Store::open(&path).unwrap().put_memory(&fact("m1")).unwrap();
         assert_ne!(store.data_version().unwrap(), before);
+    }
+
+    fn unstamped(id: &str) -> StoredMemory {
+        let mut memory = fact(id);
+        memory.record.hlc = String::new();
+        memory.record.writer = "local".into();
+        memory
+    }
+
+    fn outbox(store: &Store) -> Vec<String> {
+        let mut query = store
+            .conn
+            .prepare("SELECT memory_id FROM outbox ORDER BY rowid")
+            .unwrap();
+        query
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn saved_clock(store: &Store) -> String {
+        store
+            .conn
+            .query_row("SELECT value FROM sync_state WHERE key = 'hlc'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn local_writes_get_rising_stamps_and_are_queued() {
+        let (_dir, store) = open_temp();
+        let mut first = [unstamped("m1")];
+        store
+            .write_local(&mut first, "dev_a", 1761750000123)
+            .unwrap();
+        let mut second = [unstamped("m2")];
+        store
+            .write_local(&mut second, "dev_a", 1761750000123)
+            .unwrap();
+
+        assert_eq!(first[0].record.hlc, "1761750000123-00000-dev_a");
+        assert_eq!(second[0].record.hlc, "1761750000123-00001-dev_a");
+        let stored = store.get_memory("m2").unwrap().unwrap();
+        assert_eq!(stored.record.writer, "dev_a");
+        assert_eq!(stored.record.hlc, second[0].record.hlc);
+        assert_eq!(outbox(&store), ["m1", "m2"]);
+        assert_eq!(saved_clock(&store), "1761750000123-00001-dev_a");
+    }
+
+    #[test]
+    fn a_given_stamp_is_kept_and_later_stamps_sort_after_it() {
+        let (_dir, store) = open_temp();
+        let mut given = [fact("m1")];
+        given[0].record.hlc = "1761750009999-00007-dev_a".into();
+        store
+            .write_local(&mut given, "dev_a", 1761750000123)
+            .unwrap();
+        let mut next = [unstamped("m2")];
+        store
+            .write_local(&mut next, "dev_a", 1761750000123)
+            .unwrap();
+
+        assert_eq!(
+            store.get_memory("m1").unwrap().unwrap().record.hlc,
+            "1761750009999-00007-dev_a"
+        );
+        assert_eq!(next[0].record.hlc, "1761750009999-00008-dev_a");
+    }
+
+    #[test]
+    fn the_saved_clock_holds_across_processes_and_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        Store::open(&path)
+            .unwrap()
+            .write_local(&mut [unstamped("m1")], "dev_a", 1761750000500)
+            .unwrap();
+        let mut later = [unstamped("m2")];
+        Store::open(&path)
+            .unwrap()
+            .write_local(&mut later, "dev_b", 1761750000100)
+            .unwrap();
+        assert_eq!(later[0].record.hlc, "1761750000500-00001-dev_b");
+    }
+
+    #[test]
+    fn a_rewrite_keeps_the_queue_place() {
+        let (_dir, store) = open_temp();
+        for id in ["m1", "m2", "m1"] {
+            store.write_local(&mut [unstamped(id)], "dev_a", 1).unwrap();
+        }
+        assert_eq!(outbox(&store), ["m1", "m2"]);
+    }
+
+    #[test]
+    fn outbox_batch_is_oldest_first_and_drops_rows_with_no_memory() {
+        let (_dir, store) = open_temp();
+        for id in ["m3", "m1", "m2"] {
+            store.write_local(&mut [unstamped(id)], "dev_a", 1).unwrap();
+        }
+        store
+            .conn
+            .execute("DELETE FROM memories WHERE memory_id = 'm1'", [])
+            .unwrap();
+
+        assert_eq!(store.outbox_count().unwrap(), 3);
+        let batch = store.outbox_batch(1).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].record.memory_id, "m3");
+        assert_eq!(batch[0].vector, fact("m3").vector);
+        let ids: Vec<String> = store
+            .outbox_batch(10)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.record.memory_id)
+            .collect();
+        assert_eq!(ids, ["m3", "m2"]);
+        assert_eq!(store.outbox_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_memory_changed_since_its_push_stays_queued() {
+        let (_dir, store) = open_temp();
+        let mut pushed = [unstamped("m1"), unstamped("m2")];
+        store.write_local(&mut pushed, "dev_a", 1).unwrap();
+        store
+            .write_local(&mut [unstamped("m2")], "dev_a", 2)
+            .unwrap();
+
+        let sent: Vec<(&str, &str)> = pushed
+            .iter()
+            .map(|m| (m.record.memory_id.as_str(), m.record.hlc.as_str()))
+            .collect();
+        store.remove_pushed(&sent).unwrap();
+        assert_eq!(outbox(&store), ["m2"]);
+
+        store.remove_from_outbox("m2").unwrap();
+        assert!(outbox(&store).is_empty());
+    }
+
+    fn pulled(id: &str, hlc: &str, text: &str) -> StoredMemory {
+        let mut memory = fact(id);
+        memory.record.hlc = hlc.into();
+        memory.record.text = Some(text.into());
+        memory.record.seq = Some(9);
+        memory
+    }
+
+    #[test]
+    fn pulled_memories_replace_only_older_copies() {
+        let (_dir, store) = open_temp();
+        store
+            .put_memories(&[
+                pulled("older", "1761750000100-00000-x", "old"),
+                pulled("same", "1761750000200-00000-x", "mine"),
+                pulled("newer", "1761750000900-00000-x", "mine"),
+            ])
+            .unwrap();
+        let page = vec![
+            pulled("older", "1761750000500-00000-y", "new"),
+            pulled("same", "1761750000200-00000-x", "theirs"),
+            pulled("newer", "1761750000500-00000-y", "theirs"),
+            pulled("absent", "1761750000700-00000-y", "new"),
+        ];
+
+        let stored = store.apply_pulled(page, 42, "dev_a").unwrap();
+        let ids: Vec<&str> = stored.iter().map(|m| m.record.memory_id.as_str()).collect();
+        assert_eq!(ids, ["older", "absent"]);
+        let text = |id| store.get_memory(id).unwrap().unwrap().record.text.unwrap();
+        assert_eq!(
+            [text("older"), text("same"), text("newer"), text("absent")],
+            ["new", "mine", "mine", "new"]
+        );
+        assert_eq!(store.sync_cursor().unwrap(), 42);
+        assert_eq!(saved_clock(&store), "1761750000700-00000-dev_a");
+        assert!(outbox(&store).is_empty());
+    }
+
+    #[test]
+    fn a_malformed_pulled_stamp_is_stored_but_does_not_move_the_clock() {
+        let (_dir, store) = open_temp();
+        store
+            .apply_pulled(vec![pulled("m1", "garbage", "x")], 1, "dev_a")
+            .unwrap();
+        assert!(store.get_memory("m1").unwrap().is_some());
+        assert_eq!(saved_clock(&store), "0000000000000-00000-dev_a");
+    }
+
+    #[test]
+    fn cursor_starts_at_zero() {
+        let (_dir, store) = open_temp();
+        assert_eq!(store.sync_cursor().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_vector_is_set_only_on_the_version_it_was_made_for() {
+        let (_dir, store) = open_temp();
+        store.put_memory(&fact("m1")).unwrap();
+        let hlc = fact("m1").record.hlc;
+        assert!(
+            !store
+                .set_vector("m1", "1761750000999-00000-w", &[1.0], "m2")
+                .unwrap()
+        );
+        assert!(store.set_vector("m1", &hlc, &[1.0], "m2").unwrap());
+        let stored = store.get_memory("m1").unwrap().unwrap();
+        assert_eq!(
+            (stored.vector, stored.model_id),
+            (Some(vec![1.0]), Some("m2".into()))
+        );
+        assert_eq!(store.hlc_of("m1").unwrap(), Some(hlc));
+        assert_eq!(store.hlc_of("m9").unwrap(), None);
     }
 }

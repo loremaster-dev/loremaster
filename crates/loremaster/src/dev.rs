@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
@@ -11,7 +11,7 @@ use clap::Subcommand;
 use loremaster_core::{Hlc, Kind, Record, RecordType, Scope, new_ulid};
 use serde::Deserialize;
 
-use crate::config::{Paths, create_private_dir};
+use crate::config::{self, Paths, create_private_dir};
 use crate::embed::{self, Embedder, MODEL_ID};
 use crate::index::DIMENSIONS;
 use crate::now_ms;
@@ -131,6 +131,9 @@ fn seed(paths: &Paths, file: &Path) -> Result<(), Vec<String>> {
     embed::ensure_model(&dir, &embed::base_url(), &embed::MODEL_FILES).map_err(unavailable)?;
     let embedder = Embedder::load(&dir).map_err(unavailable)?;
 
+    // A logged-in device writes as itself and queues the memories for push. Before login there is
+    // nothing to push them to.
+    let device = config::load_credential(&paths.credentials()).map(|c| c.device_id);
     let mut clock = Hlc::new("local");
     let now = now_ms();
     let mut memories = Vec::with_capacity(lines.len());
@@ -147,7 +150,11 @@ fn seed(paths: &Paths, file: &Path) -> Result<(), Vec<String>> {
                 user_id: None,
                 memory_id: line.memory_id.unwrap_or_else(new_ulid),
                 seq: None,
-                hlc: line.hlc.unwrap_or_else(|| clock.tick(now as u64)),
+                hlc: match (&line.hlc, &device) {
+                    (Some(hlc), _) => hlc.clone(),
+                    (None, Some(_)) => String::new(),
+                    (None, None) => clock.tick(now as u64),
+                },
                 writer: "local".to_owned(),
                 record_type: line.record_type,
                 kind: line.kind,
@@ -164,9 +171,11 @@ fn seed(paths: &Paths, file: &Path) -> Result<(), Vec<String>> {
         });
     }
     let store = open_store(paths)?;
-    store
-        .put_memories(&memories)
-        .map_err(|e| vec![e.to_string()])?;
+    match &device {
+        Some(device_id) => store.write_local(&mut memories, device_id, now),
+        None => store.put_memories(&memories),
+    }
+    .map_err(|e| vec![e.to_string()])?;
     println!("seeded {}", memories.len());
     Ok(())
 }
@@ -349,6 +358,7 @@ fn bench(paths: &Paths, runs: usize) -> Result<(), Vec<String>> {
     let temp = tempfile::tempdir().map_err(|e| fail(e.to_string()))?;
     let bench_paths = Paths::new(temp.path());
     symlink(paths.models(), bench_paths.models()).map_err(|e| fail(e.to_string()))?;
+    copy_sync_files(paths, &bench_paths).map_err(|e| fail(e.to_string()))?;
 
     let started = Instant::now();
     open_store(&bench_paths)?
@@ -370,6 +380,26 @@ fn bench(paths: &Paths, runs: usize) -> Result<(), Vec<String>> {
         .and_then(|()| measure(&exe, temp.path(), runs));
     stop_daemon(&mut daemon);
     outcome
+}
+
+/// Gives the bench home the service URL and login of the real one, so the bench runs with sync on.
+/// Bench memories are not queued, so nothing of them is pushed.
+fn copy_sync_files(from: &Paths, to: &Paths) -> std::io::Result<()> {
+    for (source, target) in [
+        (from.config_toml(), to.config_toml()),
+        (from.credentials(), to.credentials()),
+    ] {
+        match fs::copy(&source, &target) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            copied => {
+                copied?;
+            }
+        }
+    }
+    if to.credentials().exists() {
+        fs::set_permissions(to.credentials(), fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 fn with_session(
@@ -503,6 +533,37 @@ mod tests {
         let (row, ok) = report_row("recall", "claude-code", &mut samples, 100, 6);
         assert!(!ok, "more failures fail the row even within budget");
         assert!(row.ends_with("FAIL"));
+    }
+
+    #[test]
+    fn bench_home_gets_the_service_url_and_a_private_login() {
+        let (real, bench) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (from, to) = (Paths::new(real.path()), Paths::new(bench.path()));
+        copy_sync_files(&from, &to).unwrap();
+        assert!(!to.config_toml().exists() && !to.credentials().exists());
+
+        fs::write(from.config_toml(), "api_url = \"https://api.example\"\n").unwrap();
+        fs::write(from.credentials(), r#"{"device_id":"d","token":"t"}"#).unwrap();
+        fs::set_permissions(from.credentials(), fs::Permissions::from_mode(0o644)).unwrap();
+        copy_sync_files(&from, &to).unwrap();
+        for file in [Paths::config_toml, Paths::credentials] {
+            assert_eq!(fs::read(file(&to)).unwrap(), fs::read(file(&from)).unwrap());
+        }
+        let mode = fs::metadata(to.credentials()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        fs::remove_file(to.credentials()).unwrap();
+        fs::create_dir(to.credentials()).unwrap();
+        assert!(copy_sync_files(&from, &to).is_err());
+    }
+
+    #[test]
+    fn bench_memories_are_not_queued_for_push() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.db")).unwrap();
+        let vectors = vec![random_unit_vector(1), random_unit_vector(2)];
+        store.put_memories(&bench_memories(&vectors)[..10]).unwrap();
+        assert_eq!(store.outbox_count().unwrap(), 0);
     }
 
     #[test]

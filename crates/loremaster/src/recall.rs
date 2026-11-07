@@ -4,11 +4,11 @@ use std::cmp::Ordering;
 use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 
-use loremaster_core::{Kind, Record, RecordType, Scope};
+use loremaster_core::{Kind, PullResponse, Record, RecordType, Scope};
 
 use crate::embed::{EmbedError, Embedder, MODEL_ID};
 use crate::index::{DimMismatch, Index};
-use crate::store::{Store, StoreError};
+use crate::store::{Store, StoreError, StoredMemory};
 
 const PROFILE_HEADER: &str =
     "Loremaster memory from past sessions. Newer user instructions override it.";
@@ -157,20 +157,103 @@ impl Recall {
         let embedder = self.embedder.get_or_init(|| embedder);
         let mut stale = Vec::new();
         self.store().for_each_memory(|memory| {
-            let current = memory.model_id.as_deref() == Some(MODEL_ID);
-            if !current && !memory.record.deleted && memory.record.text.is_some() {
+            if memory.model_id.as_deref() != Some(MODEL_ID) {
                 stale.push(memory);
             }
         })?;
-        for mut memory in stale {
-            let text = memory.record.text.as_deref().unwrap_or_default();
-            memory.vector = embedder.embed(&[text])?.pop();
-            memory.model_id = Some(MODEL_ID.to_owned());
-            self.store().put_memory(&memory)?;
-            self.index
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(&memory)?;
+        self.add_vectors(embedder, stale)
+    }
+
+    /// Stores the memories of a pulled page that are newer than the local copies, saves the
+    /// cursor after it, and updates the index in place. Returns how many it stored.
+    pub fn apply_pulled(&self, page: PullResponse, writer: &str) -> Result<usize, RecallError> {
+        let embedder = self.embedder.get();
+        let mut newer = Vec::new();
+        {
+            let store = self.store();
+            for record in page.records {
+                // This device's own pushes come back too; they are already here.
+                if store
+                    .hlc_of(&record.memory_id)?
+                    .is_none_or(|local| record.hlc > local)
+                {
+                    newer.push(record);
+                }
+            }
+        }
+        // Embedding is slow, so it runs with the store unlocked. Each call locks the model, and a
+        // prompt needs it too, so one text per call lets recall run between them.
+        let mut vectors = Vec::new();
+        if let Some(embedder) = embedder {
+            for text in newer.iter().filter_map(embeddable_text) {
+                vectors.extend(embedder.embed(&[text])?);
+            }
+        }
+        let mut vectors = vectors.into_iter();
+        let memories = newer
+            .into_iter()
+            .map(|record| {
+                let vector = embeddable_text(&record).and_then(|_| vectors.next());
+                StoredMemory {
+                    model_id: vector.as_ref().map(|_| MODEL_ID.to_owned()),
+                    vector,
+                    record: Record {
+                        user_id: None,
+                        evict_key: None,
+                        ..record
+                    },
+                }
+            })
+            .collect();
+        let stored = self
+            .store()
+            .apply_pulled(memories, page.next_cursor, writer)?;
+        {
+            let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
+            for memory in &stored {
+                if memory.vector.is_some() {
+                    index.insert(memory)?;
+                } else {
+                    index.mark_not_live(&memory.record.memory_id);
+                }
+            }
+        }
+        let count = stored.len();
+        // The model finished loading during this page, after its backfill read the store.
+        if embedder.is_none()
+            && let Some(embedder) = self.embedder.get()
+        {
+            self.add_vectors(embedder, stored)?;
+        }
+        Ok(count)
+    }
+
+    /// Embeds memories that have text and adds them to the index. A memory changed since it was
+    /// read keeps its new version.
+    fn add_vectors(
+        &self,
+        embedder: &Embedder,
+        memories: Vec<StoredMemory>,
+    ) -> Result<(), RecallError> {
+        for mut memory in memories {
+            let Some(text) = embeddable_text(&memory.record) else {
+                continue;
+            };
+            let Some(vector) = embedder.embed(&[text])?.pop() else {
+                continue;
+            };
+            let record = &memory.record;
+            if self
+                .store()
+                .set_vector(&record.memory_id, &record.hlc, &vector, MODEL_ID)?
+            {
+                memory.vector = Some(vector);
+                memory.model_id = Some(MODEL_ID.to_owned());
+                self.index
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(&memory)?;
+            }
         }
         Ok(())
     }
@@ -307,6 +390,11 @@ impl Recall {
         }
         Ok(())
     }
+}
+
+/// The text to embed: a memory that is not deleted and has text.
+fn embeddable_text(record: &Record) -> Option<&str> {
+    record.text.as_deref().filter(|_| !record.deleted)
 }
 
 /// The part of a prompt to embed. Embedding time grows with length and must fit the hook's

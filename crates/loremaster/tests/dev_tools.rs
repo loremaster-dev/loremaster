@@ -80,6 +80,60 @@ fn seed_keeps_given_ids_and_stores_tombstones_without_a_vector() {
 }
 
 #[test]
+fn seed_with_a_login_writes_as_the_device_and_queues_each_memory() {
+    let sandbox = Sandbox::with_model();
+    fs::write(
+        sandbox.paths.credentials(),
+        r#"{"device_id":"dev_01SEEDDEVICE","token":"t"}"#,
+    )
+    .unwrap();
+    let file = seed_file(
+        &sandbox,
+        "{\"type\":\"fact\",\"kind\":\"preference\",\"scope\":\"user\",\"text\":\"Prefers pnpm\"}\n\
+         {\"type\":\"fact\",\"kind\":\"decision\",\"scope\":\"user\",\"text\":\"Uses UTC\"}\n",
+    );
+    let output = dev(&sandbox, &["seed", &file]);
+    assert!(output.status.success(), "{output:?}");
+
+    let conn = rusqlite::Connection::open(sandbox.paths.store_db()).unwrap();
+    let mut query = conn
+        .prepare(
+            "SELECT m.writer, m.hlc, m.model_id FROM outbox o JOIN memories m USING (memory_id)
+             ORDER BY o.rowid",
+        )
+        .unwrap();
+    let rows: Vec<(String, String, String)> = query
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows.len(), 2);
+    for (writer, hlc, model) in &rows {
+        assert_eq!(writer, "dev_01SEEDDEVICE");
+        assert!(hlc.ends_with("-dev_01SEEDDEVICE"), "{hlc}");
+        assert_eq!(model, MODEL_ID);
+    }
+    assert!(rows[0].1 < rows[1].1);
+    assert_eq!(sandbox.query_i64("SELECT count(*) FROM memories"), 2);
+}
+
+#[test]
+fn seed_without_a_login_queues_nothing() {
+    let sandbox = Sandbox::with_model();
+    let file = seed_file(
+        &sandbox,
+        "{\"type\":\"fact\",\"kind\":\"preference\",\"scope\":\"user\",\"text\":\"Prefers pnpm\"}\n",
+    );
+    let output = dev(&sandbox, &["seed", &file]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(sandbox.query_i64("SELECT count(*) FROM outbox"), 0);
+    assert_eq!(
+        sandbox.query_i64("SELECT count(*) FROM memories WHERE writer = 'local'"),
+        1
+    );
+}
+
+#[test]
 fn any_bad_line_seeds_nothing() {
     let sandbox = Sandbox::with_model();
     let long = "x".repeat(2001);
