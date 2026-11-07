@@ -6,6 +6,7 @@ use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
+use loremaster_core::DeviceCredential;
 pub use loremaster_core::estimate_tokens;
 use serde::Deserialize;
 use thiserror::Error;
@@ -116,6 +117,20 @@ pub fn load_patterns(path: &Path) -> Result<Vec<String>, ConfigError> {
 /// Reads the sync service URL, if the user set one. A missing file means none.
 pub fn load_api_url(path: &Path) -> Result<Option<String>, ConfigError> {
     Ok(load(path)?.api_url)
+}
+
+/// The sync service URL with no trailing slash: `api_url` from `path`, else the one this binary
+/// was built with.
+pub fn service_url(path: &Path) -> Result<Option<String>, ConfigError> {
+    Ok(load_api_url(path)?
+        .or_else(|| option_env!("LOREMASTER_API_URL").map(str::to_owned))
+        .map(|url| url.trim_end_matches('/').to_owned()))
+}
+
+/// Reads the device credential saved by login. Missing or unreadable means none.
+pub fn load_credential(path: &Path) -> Option<DeviceCredential> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 fn load(path: &Path) -> Result<ConfigFile, ConfigError> {
@@ -256,6 +271,34 @@ mod tests {
             api_url_of("api_url = 1"),
             Err(ConfigError::ConfigParse { line: 1, .. })
         ));
+    }
+
+    #[test]
+    fn service_url_has_no_trailing_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "api_url = \"https://api.example/\"").unwrap();
+        assert_eq!(
+            service_url(&path).unwrap().as_deref(),
+            Some("https://api.example")
+        );
+    }
+
+    #[test]
+    fn credential_is_read_and_a_bad_file_means_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        assert_eq!(load_credential(&path), None);
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(load_credential(&path), None);
+        std::fs::write(&path, r#"{"device_id":"dev_a","token":"t"}"#).unwrap();
+        assert_eq!(
+            load_credential(&path),
+            Some(DeviceCredential {
+                device_id: "dev_a".into(),
+                token: "t".into()
+            })
+        );
     }
 
     #[test]

@@ -47,10 +47,8 @@ pub fn run(
     input: &mut impl BufRead,
     out: &mut impl Write,
 ) -> Result<(), LoginError> {
-    let api_url = config::load_api_url(&paths.config_toml())?
-        .or_else(|| option_env!("LOREMASTER_API_URL").map(str::to_owned))
-        .ok_or(LoginError::NoApiUrl)?;
-    let api_url = api_url.trim_end_matches('/');
+    let api_url = config::service_url(&paths.config_toml())?.ok_or(LoginError::NoApiUrl)?;
+    let api_url = api_url.as_str();
     let github_url =
         std::env::var("LOREMASTER_GITHUB_URL").unwrap_or_else(|_| "https://github.com".to_owned());
     let http = Http::new();
@@ -265,10 +263,7 @@ fn register(
 /// The device this machine saved at its last login. A missing or unreadable file means none, so a
 /// new login is always the way to repair it.
 fn saved_device_id(paths: &Paths) -> Option<String> {
-    let text = std::fs::read_to_string(paths.credentials()).ok()?;
-    serde_json::from_str::<DeviceCredential>(&text)
-        .ok()
-        .map(|credential| credential.device_id)
+    config::load_credential(&paths.credentials()).map(|credential| credential.device_id)
 }
 
 /// Lists the account's devices and reads which one to replace.

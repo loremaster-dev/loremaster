@@ -66,7 +66,7 @@ impl Hlc {
         } else {
             self.counter += 1;
         }
-        format!("{:013}-{:05}-{}", self.wall_ms, self.counter, self.writer)
+        self.to_string()
     }
 
     /// Moves the clock past a stamp seen from another writer, so later ticks sort after it.
@@ -77,6 +77,17 @@ impl Hlc {
             self.counter = remote.counter;
         }
         Ok(())
+    }
+}
+
+/// The fixed-width string form of the last stamp made or observed.
+impl std::fmt::Display for Hlc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:013}-{:05}-{}",
+            self.wall_ms, self.counter, self.writer
+        )
     }
 }
 
@@ -317,6 +328,14 @@ mod tests {
         ] {
             assert_eq!(Hlc::parse(bad), Err(InvalidHlc(bad.to_owned())), "{bad}");
         }
+    }
+
+    #[test]
+    fn display_shows_the_last_stamp_with_this_writer() {
+        let mut hlc = Hlc::new("dev_a1b2");
+        assert_eq!(hlc.to_string(), "0000000000000-00000-dev_a1b2");
+        hlc.observe("1761750000999-00004-dev_x9").unwrap();
+        assert_eq!(hlc.to_string(), "1761750000999-00004-dev_a1b2");
     }
 
     #[test]

@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod fake_service;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::symlink;

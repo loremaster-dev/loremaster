@@ -116,7 +116,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
       - 2 pushes at the same time for one user → all records stored, all `seq` unique.
       - 100 records → 400, nothing written.
       - User A and user B push the same `memory_id` → 2 separate items.
-  - F2. Pull records: `GET /v1/sync/pull` pages by cursor. Docs: design, tasks. Needs: F1. Status: not started.
+  - F2. Pull records: `GET /v1/sync/pull` pages by cursor. Docs: design, tasks. Needs: F1. Status: done.
     - Verify (Local):
       - 3 stored, `cursor=0` → 3 records in `seq` order, `total` = 3, `more` false.
       - `cursor=<next_cursor>` → no records, `more` false.
@@ -129,7 +129,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
       - Service unreachable, seed on A → recall probe on A still returns memories, `outbox` has 1 row. Service back → within 10 min B returns it and A's `outbox` is empty.
       - Kill A's daemon with a row in `outbox`, restart it → record reaches B.
       - B offline while A writes, B reconnects → B gets A's record, A gets B's.
-      - `dev bench` with `api_url` set → session start <= 2 s P95.
+      - `dev bench --runs 20` with sync on → the bench completes and reports session-start P95. No limit.
   - F4. Conflicts and deletes: concurrent changes converge, tombstones hold. Docs: tasks. Needs: F3. Status: not started.
     - Verify (Two homes):
       - A and B offline, each seeds a different fact, both reconnect → both facts on both, within 10 min.
@@ -147,6 +147,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
       - New home → `loremaster status` shows loaded count rising towards `total`.
       - Recall probe mid-bootstrap → returns matches from loaded rows. Stop hook mid-bootstrap → turn in `turn_queue`.
       - Kill the daemon mid-bootstrap, restart → resumes from the saved cursor, ends with 50k rows, no duplicates.
+      - `dev bench` with sync on, 50k records on the server → session start <= 2 s P95 (NFR2).
       - 5-year-old laptop, 50 Mbps → all 50k recallable within 15 min. [manual]
   - F7. 50k cap: server evicts the oldest over the cap, in class order. Docs: tasks. Needs: F1, F3. Status: not started.
     - Verify (Local):
