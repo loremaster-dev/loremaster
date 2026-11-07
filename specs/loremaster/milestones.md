@@ -251,7 +251,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
       - Previous release installed, `loremaster update` → `--version` shows the latest, service restarted, recall probe works.
       - Wrong checksum for the download → exits non-zero, installed binary unchanged.
       - Previous-release client against the current service → login state, push and pull still work.
-  - F5. Delete account: `DELETE /v1/account` revokes all tokens, then deletes all rows. Docs: tasks. Needs: M2 F3, M3 F1. Status: not started.
+  - F5. Delete account: `DELETE /v1/account` revokes all tokens, then deletes all rows. Docs: tasks. Needs: M2 F3, M3 F1. Status: done.
     - Verify (Dev stack) [approval]:
       - User with 2 devices and memories, `DELETE /v1/account` → 202. Both tokens rejected on the next request.
       - After the async run → no `users`, `devices` or `memories` items for that `user_id`.
