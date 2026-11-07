@@ -487,6 +487,34 @@ fn the_period_pushes_and_pulls_with_no_trigger() {
     sync.stop().unwrap();
 }
 
+#[test]
+fn stop_does_not_wait_for_queued_pulls() {
+    let fake = FakeService::start(100);
+    let (sandbox, _device) = home(&fake, Sandbox::without_model());
+    let (_recall, client) = client(&sandbox);
+    let sync = client.spawn(QUICK);
+    wait_for(|| fake.requests(Route::Pull) == 1, "pull at start");
+    // Each pull now gets 409 three times and takes about 2 s.
+    for _ in 0..15 {
+        fake.script(Route::Pull, StatusCode::CONFLICT, json!({"error": "retry"}));
+    }
+    for _ in 0..5 {
+        sync.triggers().pull();
+    }
+    wait_for(
+        || fake.requests(Route::Pull) == 2,
+        "a queued pull in progress",
+    );
+
+    let stopping = std::time::Instant::now();
+    sync.stop().unwrap();
+    assert!(
+        stopping.elapsed() < Duration::from_secs(4),
+        "stop took {:?}",
+        stopping.elapsed()
+    );
+}
+
 fn user_prompt(sandbox: &Sandbox, text: &str) -> String {
     let event = json!({
         "session_id": "s1", "cwd": sandbox.dir.path(), "prompt": text,

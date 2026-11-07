@@ -226,9 +226,12 @@ impl Store {
                      model_id = excluded.model_id
                  WHERE excluded.hlc > memories.hlc"
             ))?;
+            // A local change that lost to a newer one has nothing left to push.
+            let mut unqueue = tx.prepare_cached("DELETE FROM outbox WHERE memory_id = ?1")?;
             for memory in memories {
                 observe(&mut clock, &memory.record.hlc);
                 if execute_with_memory(&mut upsert, &memory)? == 1 {
+                    unqueue.execute([&memory.record.memory_id])?;
                     stored.push(memory);
                 }
             }
@@ -1247,6 +1250,21 @@ mod tests {
         assert_eq!(store.sync_cursor().unwrap(), 42);
         assert_eq!(saved_clock(&store), "1761750000700-00000-dev_a");
         assert!(outbox(&store).is_empty());
+    }
+
+    #[test]
+    fn a_newer_pulled_change_takes_the_local_one_out_of_the_outbox() {
+        let (_dir, store) = open_temp();
+        let mut local = [unstamped("lost"), unstamped("kept")];
+        store
+            .write_local(&mut local, "dev_a", 1761750000100)
+            .unwrap();
+        let page = vec![
+            pulled("lost", "1761750000900-00000-dev_b", "theirs"),
+            pulled("kept", "1761750000050-00000-dev_b", "older"),
+        ];
+        store.apply_pulled(page, 2, "dev_a").unwrap();
+        assert_eq!(outbox(&store), ["kept"]);
     }
 
     #[test]
