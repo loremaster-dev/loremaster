@@ -123,7 +123,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
       - Over 1 MB stored → `more` true on the first page. Following `next_cursor` returns each record once.
       - Offline device pushes after a reader's cursor → the next pull returns that record.
       - User B token → none of user A's records.
-  - F3. Two devices converge: `SyncClient` push, pull, embed and cadence. `dev seed` queues rows in `outbox`. Docs: design, tasks. Needs: F2. Status: not started.
+  - F3. Two devices converge: `SyncClient` push, pull, embed and cadence. `dev seed` queues rows in `outbox`. Docs: design, tasks. Needs: F2. Status: done.
     - Verify (Two homes):
       - Seed a fact on A → within 10 min, recall probe on B returns it. B's row has a `vector` and `model_id`. The DDB item has no vector.
       - Service unreachable, seed on A → recall probe on A still returns memories, `outbox` has 1 row. Service back → within 10 min B returns it and A's `outbox` is empty.

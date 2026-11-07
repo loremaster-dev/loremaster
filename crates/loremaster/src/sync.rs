@@ -146,17 +146,18 @@ impl SyncClient {
     pub fn pull(&mut self) -> Result<usize, SyncError> {
         let target = self.target()?;
         let mut stored = 0;
-        loop {
+        while !self.stopping() {
             let cursor = self.recall.store().sync_cursor()?;
             let page = self.pull_page(&target, cursor)?;
             let more = page.more;
             stored += self
                 .recall
                 .apply_pulled(page, &target.credential.device_id)?;
-            if !more || self.stopping() {
-                return Ok(stored);
+            if !more {
+                break;
             }
         }
+        Ok(stored)
     }
 
     /// Runs on its own thread until stopped: push and pull at start, then on triggers and on
@@ -179,7 +180,12 @@ impl SyncClient {
         let mut next_period = Instant::now() + cadence.period;
         loop {
             let wake = state.retry_at.unwrap_or(next_check.min(next_period));
-            match messages.recv_timeout(wake.saturating_duration_since(Instant::now())) {
+            let message = messages.recv_timeout(wake.saturating_duration_since(Instant::now()));
+            // Triggers queued before a stop are not worth a request each.
+            if self.stopping() {
+                return;
+            }
+            match message {
                 Ok(Message::Push) => self.attempt(true, false, cadence, &mut state),
                 Ok(Message::Pull) => self.attempt(false, true, cadence, &mut state),
                 Ok(Message::Stop) | Err(RecvTimeoutError::Disconnected) => return,
@@ -301,7 +307,7 @@ impl SyncClient {
                     return serde_json::from_str(&body)
                         .map_err(|e| SyncError::Unavailable(format!("bad pull reply: {e}")));
                 }
-                Err(SyncError::Conflict) if tries < CONFLICT_TRIES => {
+                Err(SyncError::Conflict) if tries < CONFLICT_TRIES && !self.stopping() => {
                     thread::sleep(PULL_CONFLICT_DELAY);
                 }
                 Err(e) => return Err(e),

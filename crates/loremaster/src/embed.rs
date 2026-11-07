@@ -183,10 +183,15 @@ impl Embedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        self.model
+        let vectors = self
+            .model
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .embed(texts, None)
-            .map_err(|e| EmbedError::Model(e.to_string()))
+            .map_err(|e| EmbedError::Model(e.to_string()));
+        // The lock is not fair: a caller that embeds in a loop would take it back before a waiting
+        // prompt wakes up. Yielding lets the prompt in between texts.
+        std::thread::yield_now();
+        vectors
     }
 }
