@@ -130,7 +130,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
       - Kill A's daemon with a row in `outbox`, restart it → record reaches B.
       - B offline while A writes, B reconnects → B gets A's record, A gets B's.
       - `dev bench --runs 20` with sync on → the bench completes and reports session-start P95. No limit.
-  - F4. Conflicts and deletes: concurrent changes converge, tombstones hold. Docs: tasks. Needs: F3. Status: not started.
+  - F4. Conflicts and deletes: concurrent changes converge, tombstones hold. Docs: tasks. Needs: F3. Status: done.
     - Verify (Two homes):
       - A and B offline, each seeds a different fact, both reconnect → both facts on both, within 10 min.
       - Same `memory_id` on both with different `hlc` → the newer text on both, within 10 min.

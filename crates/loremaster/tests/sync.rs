@@ -614,3 +614,245 @@ fn a_daemon_with_no_login_sends_nothing_and_still_recalls() {
     assert_eq!(fake.requests(Route::Push) + fake.requests(Route::Pull), 0);
     assert_eq!(outbox(&sandbox), 1);
 }
+
+/// A logged-in home that syncs only when a test asks it to.
+struct Home {
+    sandbox: Sandbox,
+    device: DeviceCredential,
+    recall: Arc<Recall>,
+    client: SyncClient,
+}
+
+impl Home {
+    fn new(fake: &FakeService, with_model: bool) -> Self {
+        let sandbox = if with_model {
+            Sandbox::with_model()
+        } else {
+            Sandbox::without_model()
+        };
+        let (sandbox, device) = home(fake, sandbox);
+        let (recall, client) = client(&sandbox);
+        if with_model {
+            recall.set_embedder(embedder()).unwrap();
+        }
+        Self {
+            sandbox,
+            device,
+            recall,
+            client,
+        }
+    }
+
+    fn write(&self, memories: &mut [StoredMemory]) {
+        write_local(&self.sandbox, &self.device, memories);
+    }
+
+    fn push(&mut self) {
+        self.client.push_outbox().unwrap();
+    }
+
+    fn pull(&mut self) {
+        self.client.pull().unwrap();
+    }
+
+    fn stored(&self, memory_id: &str) -> Record {
+        self.sandbox
+            .store()
+            .get_memory(memory_id)
+            .unwrap()
+            .unwrap()
+            .record
+    }
+
+    fn profile(&self) -> String {
+        self.recall
+            .profile("p", now_ms())
+            .unwrap()
+            .map(|recalled| recalled.text)
+            .unwrap_or_default()
+    }
+
+    /// The stamp `wall_ms` of this device.
+    fn stamp(&self, wall_ms: u64) -> String {
+        format!("{wall_ms:013}-00000-{}", self.device.device_id)
+    }
+}
+
+fn tombstone_of(memory_id: &str) -> StoredMemory {
+    let mut tombstone = fact("");
+    tombstone.record = Record {
+        memory_id: memory_id.to_owned(),
+        deleted: true,
+        record_type: None,
+        kind: None,
+        scope: None,
+        text: None,
+        created_at: None,
+        ..tombstone.record
+    };
+    tombstone
+}
+
+#[test]
+fn offline_devices_that_create_at_once_both_get_everything() {
+    let fake = FakeService::start(100);
+    let (mut a, mut b) = (Home::new(&fake, true), Home::new(&fake, true));
+    let deploy = fact("Deploys go through ArgoCD, not manual kubectl");
+    let pnpm = fact("Prefers pnpm over npm");
+    let ids = [
+        deploy.record.memory_id.clone(),
+        pnpm.record.memory_id.clone(),
+    ];
+    a.write(&mut [deploy]);
+    b.write(&mut [pnpm]);
+
+    a.push();
+    b.push();
+    a.pull();
+    b.pull();
+
+    for home in [&a, &b] {
+        for id in &ids {
+            assert!(!home.stored(id).deleted);
+        }
+        assert_eq!(outbox(&home.sandbox), 0);
+    }
+    let on_a = prompt(&a.recall, "which package manager should I use?").unwrap();
+    assert!(on_a.contains("pnpm"), "{on_a}");
+    let on_b = prompt(&b.recall, "how do we deploy?").unwrap();
+    assert!(on_b.contains("ArgoCD"), "{on_b}");
+}
+
+#[test]
+fn the_newer_change_of_one_memory_wins_on_both() {
+    for order in [
+        "a pushes first",
+        "b pushes first",
+        "b pulls before it pushes",
+    ] {
+        let fake = FakeService::start(100);
+        let (mut a, mut b) = (Home::new(&fake, false), Home::new(&fake, false));
+        let id = new_ulid();
+        let version = |home: &Home, text: &str, wall_ms| {
+            let mut memory = fact(text);
+            memory.record.memory_id = id.clone();
+            memory.record.hlc = home.stamp(wall_ms);
+            memory
+        };
+        a.write(&mut [version(&a, "Uses npm", 1_761_750_000_100)]);
+        b.write(&mut [version(&b, "Uses pnpm", 1_761_750_000_900)]);
+
+        match order {
+            "a pushes first" => {
+                a.push();
+                b.push();
+                a.pull();
+                b.pull();
+            }
+            "b pushes first" => {
+                b.push();
+                a.push();
+                b.pull();
+                a.pull();
+            }
+            _ => {
+                a.push();
+                b.pull();
+                b.push();
+                a.pull();
+            }
+        }
+
+        for home in [&a, &b] {
+            let stored = home.stored(&id);
+            assert_eq!(stored.text.as_deref(), Some("Uses pnpm"), "{order}");
+            assert_eq!(stored.hlc, b.stamp(1_761_750_000_900));
+            assert_eq!(outbox(&home.sandbox), 0);
+        }
+        assert_eq!(fake.records(USER).len(), 1);
+    }
+}
+
+#[test]
+fn a_tombstone_written_while_the_other_is_offline_takes_the_memory_away_there() {
+    let fake = FakeService::start(100);
+    let (mut a, mut b) = (Home::new(&fake, false), Home::new(&fake, true));
+    let deploy = fact("Deploys go through ArgoCD, not manual kubectl");
+    let id = deploy.record.memory_id.clone();
+    a.write(&mut [deploy]);
+    a.push();
+    b.pull();
+    assert!(prompt(&b.recall, "how do we deploy?").is_some());
+    assert!(b.profile().contains("ArgoCD"));
+
+    a.write(&mut [tombstone_of(&id)]);
+    a.push();
+    b.pull();
+
+    assert!(b.stored(&id).deleted);
+    let stored = b.sandbox.store().get_memory(&id).unwrap().unwrap();
+    assert_eq!(stored.vector, None);
+    assert_eq!(prompt(&b.recall, "how do we deploy?"), None);
+    assert!(!b.profile().contains("ArgoCD"));
+}
+
+#[test]
+fn an_older_change_after_a_newer_tombstone_does_not_resurrect_it() {
+    let fake = FakeService::start(100);
+    let (mut a, mut b) = (Home::new(&fake, false), Home::new(&fake, false));
+    let deploy = fact("Deploys go through ArgoCD, not manual kubectl");
+    let id = deploy.record.memory_id.clone();
+    a.write(&mut [deploy]);
+    a.push();
+    b.pull();
+    let mut tombstone = [tombstone_of(&id)];
+    a.write(&mut tombstone);
+    a.push();
+
+    let tombstone_wall: u64 = tombstone[0].record.hlc[..13].parse().unwrap();
+    let mut late = fact("Deploys go through kubectl");
+    late.record.memory_id = id.clone();
+    late.record.hlc = b.stamp(tombstone_wall - 1_000);
+    b.write(&mut [late]);
+    b.push();
+    b.pull();
+    a.pull();
+
+    assert!(fake.records(USER)[0].deleted);
+    for home in [&a, &b] {
+        assert!(home.stored(&id).deleted);
+        assert_eq!(home.stored(&id).hlc, tombstone[0].record.hlc);
+        assert_eq!(outbox(&home.sandbox), 0);
+    }
+}
+
+#[test]
+fn a_pulled_superseded_fact_is_not_recalled() {
+    let fake = FakeService::start(100);
+    let (mut a, mut b) = (Home::new(&fake, false), Home::new(&fake, true));
+    let old = fact("Uses npm for packages");
+    let id = old.record.memory_id.clone();
+    a.write(&mut [old.clone()]);
+    a.push();
+    b.pull();
+
+    let new = fact("Uses pnpm for packages");
+    let mut replaced = old;
+    replaced.record.hlc = String::new();
+    replaced.record.superseded_by = Some(new.record.memory_id.clone());
+    a.write(&mut [new, replaced]);
+    a.push();
+    b.pull();
+
+    assert!(b.stored(&id).superseded_by.is_some());
+    let reply = prompt(&b.recall, "which package manager should I use?").unwrap();
+    assert!(
+        reply.contains("Uses pnpm") && !reply.contains("Uses npm"),
+        "{reply}"
+    );
+    let profile = b.profile();
+    assert!(
+        profile.contains("Uses pnpm") && !profile.contains("Uses npm"),
+        "{profile}"
+    );
+}

@@ -74,7 +74,14 @@ struct SeedLine {
     deleted: bool,
 }
 
-fn line_error(line: &SeedLine) -> Option<String> {
+/// What is wrong with a seed line, if anything. `device` is the logged-in device, whose memories
+/// the service takes only with its own stamps.
+fn line_error(line: &SeedLine, device: Option<&str>) -> Option<String> {
+    if let (Some(hlc), Some(device)) = (&line.hlc, device)
+        && Hlc::parse(hlc).map_or(true, |stamp| stamp.writer() != device)
+    {
+        return Some("hlc writer is not this device".to_owned());
+    }
     let needs = |present: bool, name: &str| (!present).then(|| format!("missing {name}"));
     let text_length = line.text.as_ref().map_or(0, |text| text.chars().count());
     if text_length > MAX_TEXT_CHARS {
@@ -97,7 +104,7 @@ fn line_error(line: &SeedLine) -> Option<String> {
         })
 }
 
-fn parse_seed(text: &str) -> Result<Vec<SeedLine>, Vec<String>> {
+fn parse_seed(device: Option<&str>, text: &str) -> Result<Vec<SeedLine>, Vec<String>> {
     let mut lines = Vec::new();
     let mut errors = Vec::new();
     for (number, line) in text
@@ -108,7 +115,7 @@ fn parse_seed(text: &str) -> Result<Vec<SeedLine>, Vec<String>> {
         let number = number + 1;
         match serde_json::from_str::<SeedLine>(line) {
             Err(_) => errors.push(format!("line {number}: invalid JSON")),
-            Ok(seed) => match line_error(&seed) {
+            Ok(seed) => match line_error(&seed, device) {
                 Some(error) => errors.push(format!("line {number}: {error}")),
                 None => lines.push(seed),
             },
@@ -124,16 +131,16 @@ fn parse_seed(text: &str) -> Result<Vec<SeedLine>, Vec<String>> {
 fn seed(paths: &Paths, file: &Path) -> Result<(), Vec<String>> {
     let text =
         fs::read_to_string(file).map_err(|_| vec![format!("cannot read {}", file.display())])?;
-    let lines = parse_seed(&text)?;
+    // A logged-in device writes as itself and queues the memories for push. Before login there is
+    // nothing to push them to.
+    let device = config::load_credential(&paths.credentials()).map(|c| c.device_id);
+    let lines = parse_seed(device.as_deref(), &text)?;
 
     let unavailable = |_| vec!["embedding model not available".to_owned()];
     let dir = embed::model_dir(&paths.models());
     embed::ensure_model(&dir, &embed::base_url(), &embed::MODEL_FILES).map_err(unavailable)?;
     let embedder = Embedder::load(&dir).map_err(unavailable)?;
 
-    // A logged-in device writes as itself and queues the memories for push. Before login there is
-    // nothing to push them to.
-    let device = config::load_credential(&paths.credentials()).map(|c| c.device_id);
     let mut clock = Hlc::new("local");
     let now = now_ms();
     let mut memories = Vec::with_capacity(lines.len());
@@ -472,12 +479,36 @@ mod tests {
     #[test]
     fn valid_seed_lines_parse() {
         let parsed = parse_seed(
+            None,
             "{\"type\":\"fact\",\"kind\":\"preference\",\"scope\":\"user\",\"text\":\"t\"}\n\n\
              {\"type\":\"episode\",\"scope\":\"project\",\"project_id\":\"p\",\"text\":\"t\"}\n\
              {\"memory_id\":\"m\",\"deleted\":true}\n",
         )
         .unwrap();
         assert_eq!(parsed.len(), 3);
+    }
+
+    #[test]
+    fn with_a_login_a_given_hlc_must_be_this_device_s() {
+        let line =
+            |hlc: &str| format!("{{\"memory_id\":\"m\",\"deleted\":true,\"hlc\":\"{hlc}\"}}");
+        let mine = line("1761750000123-00000-dev_me");
+        let theirs = line("1761750000123-00000-dev_other");
+        let garbage = line("garbage");
+        let text = format!("{mine}\n{theirs}\n{garbage}\n");
+
+        assert_eq!(
+            parse_seed(None, &text).map(|lines| lines.len()).ok(),
+            Some(3)
+        );
+        assert_eq!(
+            parse_seed(Some("dev_me"), &text).err().unwrap(),
+            [
+                "line 2: hlc writer is not this device",
+                "line 3: hlc writer is not this device",
+            ]
+        );
+        assert!(parse_seed(Some("dev_me"), &format!("{mine}\n")).is_ok());
     }
 
     #[test]
@@ -492,7 +523,7 @@ mod tests {
              {{\"type\":\"fact\",\"kind\":\"pitfall\",\"scope\":\"user\"}}\n\
              {{\"type\":\"fact\",\"scope\":\"user\",\"text\":\"t\"}}\n"
         );
-        let errors = parse_seed(&text).err().unwrap();
+        let errors = parse_seed(None, &text).err().unwrap();
         assert_eq!(
             errors,
             [
