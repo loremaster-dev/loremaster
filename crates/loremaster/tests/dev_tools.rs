@@ -118,6 +118,28 @@ fn seed_with_a_login_writes_as_the_device_and_queues_each_memory() {
 }
 
 #[test]
+fn seed_with_a_login_refuses_another_device_s_stamp() {
+    let sandbox = Sandbox::with_model();
+    fs::write(
+        sandbox.paths.credentials(),
+        r#"{"device_id":"dev_01SEEDDEVICE","token":"t"}"#,
+    )
+    .unwrap();
+    let file = seed_file(
+        &sandbox,
+        "{\"type\":\"fact\",\"kind\":\"preference\",\"scope\":\"user\",\"text\":\"ok\"}\n\
+         {\"memory_id\":\"m\",\"deleted\":true,\"hlc\":\"1761750000123-00000-dev_other\"}\n",
+    );
+    let output = dev(&sandbox, &["seed", &file]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        "line 2: hlc writer is not this device"
+    );
+    assert!(!sandbox.paths.store_db().exists());
+}
+
+#[test]
 fn seed_without_a_login_queues_nothing() {
     let sandbox = Sandbox::with_model();
     let file = seed_file(
