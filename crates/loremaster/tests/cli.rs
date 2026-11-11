@@ -14,7 +14,7 @@ fn help_lists_the_commands() {
     let output = loremaster(&["--help"]);
     assert!(output.status.success());
     let help = String::from_utf8_lossy(&output.stdout);
-    for command in ["hook", "daemon", "enable", "login"] {
+    for command in ["hook", "daemon", "enable", "login", "status"] {
         assert!(help.contains(command), "{help}");
     }
     assert_eq!(help.contains("dev "), cfg!(feature = "dev"), "{help}");

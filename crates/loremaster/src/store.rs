@@ -62,6 +62,7 @@ const MEMORY_COLUMNS: &str = "memory_id, type, kind, scope, project_id, text, cr
 const MEMORY_VALUES: &str = "?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14";
 const CLOCK_KEY: &str = "hlc";
 const CURSOR_KEY: &str = "cursor";
+const TOTAL_KEY: &str = "total";
 
 /// Why the store could not be opened or used.
 #[derive(Debug, Error)]
@@ -82,6 +83,17 @@ pub struct StoredMemory {
     pub record: Record,
     pub vector: Option<Vec<f32>>,
     pub model_id: Option<String>,
+}
+
+/// How much of the user's memory a device holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    /// Live memories with a vector, so recall can find them.
+    pub recallable: i64,
+    /// The service's count of the user's live memories at the last pull. `None` before one.
+    pub total: Option<i64>,
+    /// Memories waiting to be pushed.
+    pub outbox: i64,
 }
 
 /// Capture progress for one agent session.
@@ -203,12 +215,13 @@ impl Store {
     }
 
     /// Stores each pulled memory whose `hlc` is newer than the local copy, the cursor after the
-    /// page, and the device clock moved past every stamp in it, in one transaction. Returns the
-    /// memories it stored.
+    /// page, the service's count of live memories, and the device clock moved past every stamp in
+    /// the page, in one transaction. Returns the memories it stored.
     pub fn apply_pulled(
         &self,
         memories: Vec<StoredMemory>,
         cursor: i64,
+        total: i64,
         writer: &str,
     ) -> Result<Vec<StoredMemory>, StoreError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
@@ -237,6 +250,7 @@ impl Store {
             }
         }
         save_state(&tx, CURSOR_KEY, &cursor.to_string())?;
+        save_state(&tx, TOTAL_KEY, &total.to_string())?;
         save_state(&tx, CLOCK_KEY, &clock.to_string())?;
         tx.commit()?;
         Ok(stored)
@@ -271,15 +285,35 @@ impl Store {
 
     /// The `next_cursor` of the last pulled page, or 0 before the first pull.
     pub fn sync_cursor(&self) -> Result<i64, StoreError> {
+        Ok(self.state_number(CURSOR_KEY)?.unwrap_or(0))
+    }
+
+    /// How much of the user's memory this device can recall, embedded with `model_id`.
+    pub fn progress(&self, model_id: &str) -> Result<Progress, StoreError> {
+        let (recallable, outbox) = self.conn.query_row(
+            "SELECT
+                 (SELECT count(*) FROM memories WHERE deleted = 0 AND model_id = ?1),
+                 (SELECT count(*) FROM outbox)",
+            [model_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(Progress {
+            recallable,
+            total: self.state_number(TOTAL_KEY)?,
+            outbox,
+        })
+    }
+
+    fn state_number(&self, key: &str) -> Result<Option<i64>, StoreError> {
         let value: Option<String> = self
             .conn
             .query_row(
                 "SELECT value FROM sync_state WHERE key = ?1",
-                [CURSOR_KEY],
+                [key],
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(value.and_then(|v| v.parse().ok()).unwrap_or(0))
+        Ok(value.and_then(|v| v.parse().ok()))
     }
 
     /// Number of memories waiting to be pushed.
@@ -1038,7 +1072,7 @@ mod tests {
         };
         assert!(store.commit_turn(turn).is_err());
         assert!(store.write_local(&mut [fact("m1")], "w", 1).is_err());
-        assert!(store.apply_pulled(vec![fact("m1")], 1, "w").is_err());
+        assert!(store.apply_pulled(vec![fact("m1")], 1, 1, "w").is_err());
         assert!(store.hlc_of("m1").is_err());
         assert!(store.set_vector("m1", "h", &[1.0], "m").is_err());
         assert!(store.outbox_batch(1).is_err());
@@ -1051,6 +1085,7 @@ mod tests {
         assert!(store.sync_cursor().is_err());
         assert!(store.outbox_count().is_err());
         assert!(store.remove_from_outbox("m1").is_err());
+        assert!(store.progress("m").is_err());
     }
 
     #[test]
@@ -1239,7 +1274,7 @@ mod tests {
             pulled("absent", "1761750000700-00000-y", "new"),
         ];
 
-        let stored = store.apply_pulled(page, 42, "dev_a").unwrap();
+        let stored = store.apply_pulled(page, 42, 3, "dev_a").unwrap();
         let ids: Vec<&str> = stored.iter().map(|m| m.record.memory_id.as_str()).collect();
         assert_eq!(ids, ["older", "absent"]);
         let text = |id| store.get_memory(id).unwrap().unwrap().record.text.unwrap();
@@ -1263,7 +1298,7 @@ mod tests {
             pulled("lost", "1761750000900-00000-dev_b", "theirs"),
             pulled("kept", "1761750000050-00000-dev_b", "older"),
         ];
-        store.apply_pulled(page, 2, "dev_a").unwrap();
+        store.apply_pulled(page, 2, 2, "dev_a").unwrap();
         assert_eq!(outbox(&store), ["kept"]);
     }
 
@@ -1271,10 +1306,50 @@ mod tests {
     fn a_malformed_pulled_stamp_is_stored_but_does_not_move_the_clock() {
         let (_dir, store) = open_temp();
         store
-            .apply_pulled(vec![pulled("m1", "garbage", "x")], 1, "dev_a")
+            .apply_pulled(vec![pulled("m1", "garbage", "x")], 1, 1, "dev_a")
             .unwrap();
         assert!(store.get_memory("m1").unwrap().is_some());
         assert_eq!(saved_clock(&store), "0000000000000-00000-dev_a");
+    }
+
+    #[test]
+    fn each_pulled_page_saves_the_service_total() {
+        let (_dir, store) = open_temp();
+        assert_eq!(store.progress("m").unwrap().total, None);
+        store
+            .apply_pulled(vec![fact("m1")], 1, 40, "dev_a")
+            .unwrap();
+        assert_eq!(store.progress("m").unwrap().total, Some(40));
+        store
+            .apply_pulled(vec![fact("m2")], 2, 41, "dev_a")
+            .unwrap();
+        assert_eq!(store.progress("m").unwrap().total, Some(41));
+    }
+
+    #[test]
+    fn progress_counts_live_rows_with_a_current_vector_and_the_outbox() {
+        let (_dir, store) = open_temp();
+        let mut gone = fact("gone");
+        gone.record.deleted = true;
+        let mut unembedded = fact("unembedded");
+        (unembedded.vector, unembedded.model_id) = (None, None);
+        let mut old_model = fact("old_model");
+        old_model.model_id = Some("other".into());
+        store
+            .put_memories(&[fact("a"), fact("b"), gone, unembedded, old_model])
+            .unwrap();
+        store
+            .write_local(&mut [unstamped("c")], "dev_a", 1)
+            .unwrap();
+
+        assert_eq!(
+            store.progress("m").unwrap(),
+            Progress {
+                recallable: 3,
+                total: None,
+                outbox: 1
+            }
+        );
     }
 
     #[test]

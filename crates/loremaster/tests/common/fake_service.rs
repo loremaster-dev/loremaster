@@ -32,7 +32,10 @@ struct FakeState {
     page_size: usize,
     scripted: HashMap<Route, VecDeque<(StatusCode, Value)>>,
     requests: HashMap<Route, usize>,
+    /// Requests to a route after this many get 503.
+    fail_after: HashMap<Route, usize>,
     pushes: Vec<Value>,
+    pull_cursors: Vec<i64>,
 }
 
 type Shared = Arc<Mutex<FakeState>>;
@@ -104,6 +107,25 @@ impl FakeService {
             .push_back((status, body));
     }
 
+    /// Makes each request to `route` after the first `requests` fail with 503, until `recover`.
+    pub fn fail_after(&self, route: Route, requests: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .fail_after
+            .insert(route, requests);
+    }
+
+    /// Ends every `fail_after`.
+    pub fn recover(&self) {
+        self.state.lock().unwrap().fail_after.clear();
+    }
+
+    /// The cursor of each pull that got a page, in order.
+    pub fn pull_cursors(&self) -> Vec<i64> {
+        self.state.lock().unwrap().pull_cursors.clone()
+    }
+
     /// The user's stored records, in `seq` order.
     pub fn records(&self, user: &str) -> Vec<Record> {
         let state = self.state.lock().unwrap();
@@ -161,7 +183,18 @@ fn begin(
     route: Route,
     headers: &HeaderMap,
 ) -> Result<(String, String), (StatusCode, Json<Value>)> {
-    *state.requests.entry(route).or_default() += 1;
+    let count = state.requests.entry(route).or_default();
+    *count += 1;
+    if state
+        .fail_after
+        .get(&route)
+        .is_some_and(|limit| *count > *limit)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "unavailable"})),
+        ));
+    }
     if let Some((status, body)) = state.scripted.get_mut(&route).and_then(VecDeque::pop_front) {
         return Err((status, Json(body)));
     }
@@ -226,6 +259,7 @@ async fn pull(
         .and_then(|q| q.strip_prefix("cursor="))
         .and_then(|value| value.parse().ok())
         .expect("a pull has a cursor");
+    state.pull_cursors.push(cursor);
     let page_size = state.page_size;
     let data = state.users.entry(user).or_default();
     let mut after: Vec<&Record> = data

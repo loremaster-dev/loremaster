@@ -856,3 +856,68 @@ fn a_pulled_superseded_fact_is_not_recalled() {
         "{profile}"
     );
 }
+
+/// 25 records on the fake in pages of 10, with a deploy fact on the first page and a package
+/// manager fact on the third.
+fn bootstrap_fake() -> (FakeService, Vec<Record>) {
+    let fake = FakeService::start(10);
+    let records: Vec<Record> = (0..25)
+        .map(|n| {
+            let text = match n {
+                3 => "Deploys go through ArgoCD, not manual kubectl".to_owned(),
+                23 => "Prefers pnpm over npm".to_owned(),
+                _ => format!("Note number {n} about the weather"),
+            };
+            remote(&text, 1_761_750_000_000 + n)
+        })
+        .collect();
+    fake.insert(USER, &records);
+    (fake, records)
+}
+
+fn embedded_client(sandbox: &Sandbox) -> (Arc<Recall>, SyncClient) {
+    let (recall, client) = client(sandbox);
+    recall.set_embedder(embedder()).unwrap();
+    (recall, client)
+}
+
+#[test]
+fn a_bootstrap_stopped_part_way_continues_from_its_cursor() {
+    let (fake, _records) = bootstrap_fake();
+    let (sandbox, _device) = home(&fake, Sandbox::with_model());
+    fake.fail_after(Route::Pull, 2);
+    let (_recall, mut client) = embedded_client(&sandbox);
+
+    assert!(matches!(client.pull(), Err(SyncError::Unavailable(_))));
+    let progress = sandbox.store().progress(MODEL_ID).unwrap();
+    assert_eq!((progress.recallable, progress.total), (20, Some(25)));
+
+    drop(client);
+    fake.recover();
+    let (_recall, mut restarted) = embedded_client(&sandbox);
+    assert_eq!(restarted.pull().unwrap(), 5);
+
+    let progress = sandbox.store().progress(MODEL_ID).unwrap();
+    assert_eq!((progress.recallable, progress.total), (25, Some(25)));
+    assert_eq!(sandbox.query_i64("SELECT count(*) FROM memories"), 25);
+    assert_eq!(fake.pull_cursors(), [0, 10, 20]);
+}
+
+#[test]
+fn recall_uses_the_pages_loaded_so_far() {
+    let (fake, _records) = bootstrap_fake();
+    let (sandbox, _device) = home(&fake, Sandbox::with_model());
+    fake.fail_after(Route::Pull, 2);
+    let (recall, mut client) = embedded_client(&sandbox);
+    assert!(client.pull().is_err());
+
+    let deploy = prompt(&recall, "how do we deploy?").unwrap_or_default();
+    assert!(deploy.contains("ArgoCD"), "{deploy}");
+    let packages = prompt(&recall, "which package manager should I use?").unwrap_or_default();
+    assert!(!packages.contains("pnpm"), "{packages}");
+
+    fake.recover();
+    client.pull().unwrap();
+    let packages = prompt(&recall, "which package manager should I use?").unwrap_or_default();
+    assert!(packages.contains("pnpm"), "{packages}");
+}

@@ -207,7 +207,7 @@ impl Recall {
             .collect();
         let stored = self
             .store()
-            .apply_pulled(memories, page.next_cursor, writer)?;
+            .apply_pulled(memories, page.next_cursor, page.total, writer)?;
         {
             let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
             for memory in &stored {
