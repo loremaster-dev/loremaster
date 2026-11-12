@@ -13,6 +13,7 @@ pub mod recall;
 pub mod redact;
 pub mod server;
 pub mod spool;
+pub mod status;
 pub mod store;
 pub mod sync;
 

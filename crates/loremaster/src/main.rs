@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use loremaster::config::Paths;
 use loremaster::enable::{self, Agent};
-use loremaster::{hook, login, server};
+use loremaster::{hook, login, server, status};
 
 /// Cross-device, cross-agent memory for AI agents.
 #[derive(Parser)]
@@ -28,6 +28,8 @@ enum Command {
     },
     /// Sign this machine in with GitHub and register it as a device
     Login,
+    /// Show whether sync is on and how much memory this device can recall
+    Status,
     /// Development tools
     #[cfg(feature = "dev")]
     Dev {
@@ -89,6 +91,16 @@ fn main() -> ExitCode {
                 Err(e) => fail(format!("error: {e}")),
             }
         }
+        Command::Status => match Paths::from_env()
+            .map_err(|e| e.to_string())
+            .and_then(|paths| status::report(&paths).map_err(|e| e.to_string()))
+        {
+            Ok(report) => {
+                println!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(e),
+        },
         #[cfg(feature = "dev")]
         Command::Dev { command } => loremaster::dev::run(command),
     }
