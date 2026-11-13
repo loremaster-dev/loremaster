@@ -107,11 +107,23 @@ Resources:
           AttributeType: S
         - AttributeName: seq
           AttributeType: N
+        - AttributeName: evict_key
+          AttributeType: S
       KeySchema:
         - AttributeName: user_id
           KeyType: HASH
         - AttributeName: memory_id
           KeyType: RANGE
+      # Live memories only, oldest first in eviction order: tombstones have no evict_key.
+      GlobalSecondaryIndexes:
+        - IndexName: by_evict_key
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: evict_key
+              KeyType: RANGE
+          Projection:
+            ProjectionType: KEYS_ONLY
       LocalSecondaryIndexes:
         - IndexName: by_seq
           KeySchema:

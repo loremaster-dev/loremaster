@@ -60,8 +60,9 @@ create devices \
   --global-secondary-indexes 'IndexName=by_user,KeySchema=[{AttributeName=user_id,KeyType=HASH}],Projection={ProjectionType=ALL}'
 
 create memories \
-  --attribute-definitions AttributeName=user_id,AttributeType=S AttributeName=memory_id,AttributeType=S AttributeName=seq,AttributeType=N \
+  --attribute-definitions AttributeName=user_id,AttributeType=S AttributeName=memory_id,AttributeType=S AttributeName=seq,AttributeType=N AttributeName=evict_key,AttributeType=S \
   --key-schema AttributeName=user_id,KeyType=HASH AttributeName=memory_id,KeyType=RANGE \
+  --global-secondary-indexes 'IndexName=by_evict_key,KeySchema=[{AttributeName=user_id,KeyType=HASH},{AttributeName=evict_key,KeyType=RANGE}],Projection={ProjectionType=KEYS_ONLY}' \
   --local-secondary-indexes 'IndexName=by_seq,KeySchema=[{AttributeName=user_id,KeyType=HASH},{AttributeName=seq,KeyType=RANGE}],Projection={ProjectionType=ALL}'
 
 echo "DynamoDB Local on $endpoint with tables users, devices and memories"

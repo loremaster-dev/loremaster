@@ -37,36 +37,60 @@ const GITHUB_TIMEOUT: Duration = Duration::from_secs(5);
 const DEVICE_LIMIT: u32 = 10;
 const TRANSACTION_TRIES: u32 = 3;
 const MAX_PUSH_RECORDS: usize = 99;
+/// The writer of the tombstones that the cap eviction makes.
+const SERVER_WRITER: &str = "server";
 const MAX_TEXT_CHARS: usize = 2_000;
 const BATCH_WRITE_ITEMS: usize = 25;
+const BATCH_GET_KEYS: usize = 100;
 const UNPROCESSED_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_UNPROCESSED_BACKOFF: Duration = Duration::from_secs(2);
 
-/// Where the service keeps its data and checks GitHub accounts.
+/// Where the service keeps its data, how many live memories a user keeps, and where it checks
+/// GitHub accounts.
 pub struct Config {
     pub users_table: String,
     pub devices_table: String,
     pub memories_table: String,
     pub github_api_url: String,
+    pub memory_cap: i64,
 }
 
-/// A required environment variable is not set.
+/// An environment variable is not set, or its value is not valid.
 #[derive(Debug, Error)]
-#[error("environment variable {0} is not set")]
-pub struct MissingEnv(&'static str);
+pub enum EnvError {
+    #[error("environment variable {0} is not set")]
+    Missing(&'static str),
+    #[error("environment variable {0} is not a valid value")]
+    Invalid(&'static str),
+}
+
+const DEFAULT_MEMORY_CAP: i64 = 50_000;
 
 impl Config {
-    /// Reads `USERS_TABLE`, `DEVICES_TABLE`, `MEMORIES_TABLE` and `GITHUB_API_URL` (default
-    /// `https://api.github.com`).
-    pub fn from_env() -> Result<Self, MissingEnv> {
-        let required = |name| std::env::var(name).map_err(|_| MissingEnv(name));
+    /// Reads `USERS_TABLE`, `DEVICES_TABLE`, `MEMORIES_TABLE`, `GITHUB_API_URL` (default
+    /// `https://api.github.com`) and `MEMORY_CAP` (default 50,000).
+    pub fn from_env() -> Result<Self, EnvError> {
+        let required = |name| std::env::var(name).map_err(|_| EnvError::Missing(name));
         Ok(Self {
             users_table: required("USERS_TABLE")?,
             devices_table: required("DEVICES_TABLE")?,
             memories_table: required("MEMORIES_TABLE")?,
             github_api_url: std::env::var("GITHUB_API_URL")
                 .unwrap_or_else(|_| "https://api.github.com".to_owned()),
+            memory_cap: memory_cap(std::env::var("MEMORY_CAP").ok().as_deref())?,
         })
+    }
+}
+
+/// A cap of 0 or less would evict every memory, so it stops the service instead.
+fn memory_cap(value: Option<&str>) -> Result<i64, EnvError> {
+    match value {
+        None => Ok(DEFAULT_MEMORY_CAP),
+        Some(value) => value
+            .parse()
+            .ok()
+            .filter(|cap| *cap > 0)
+            .ok_or(EnvError::Invalid("MEMORY_CAP")),
     }
 }
 
@@ -584,8 +608,13 @@ async fn push_records(
             applied: Vec::new(),
         }));
     }
-    let next_seq = next_seq(&state, &caller.user_id).await?;
-    let stored = stored_versions(&state, &caller.user_id, &records).await?;
+    let (next_seq, live_count) = user_counters(&state, &caller.user_id).await?;
+    let stored = stored_versions(
+        &state,
+        &caller.user_id,
+        records.iter().map(|record| record.memory_id.as_str()),
+    )
+    .await?;
     let newer: Vec<&Record> = records
         .iter()
         .filter(|record| {
@@ -612,26 +641,31 @@ async fn push_records(
         items.push(memory_put(&state, &caller.user_id, seq, record, read)?);
     }
     let new_next_seq = next_seq + newer.len() as i64;
-    let user = Update::builder()
-        .table_name(&state.config.users_table)
-        .key("user_id", AttributeValue::S(caller.user_id.clone()))
-        .update_expression("SET next_seq = :new, live_count = live_count + :delta")
-        // A push that passed auth just before an account deletion must not write rows that the
-        // purge has already listed.
-        .condition_expression("next_seq = :old AND attribute_not_exists(deleting)")
-        .expression_attribute_values(":old", AttributeValue::N(next_seq.to_string()))
-        .expression_attribute_values(":new", AttributeValue::N(new_next_seq.to_string()))
-        .expression_attribute_values(":delta", AttributeValue::N(live_delta.to_string()))
-        .build()
-        .map_err(internal)?;
-    items.insert(0, TransactWriteItem::builder().update(user).build());
+    items.insert(
+        0,
+        user_update(&state, &caller.user_id, next_seq, new_next_seq, live_delta)?,
+    );
     match transact(&state, items).await {
-        Ok(()) => Ok(Json(PushResponse {
-            applied: newer
+        Ok(()) => {
+            let live = live_count + live_delta;
+            // The records are stored, so the push succeeds; a later push evicts what this one
+            // could not.
+            let pushed_live = newer
                 .iter()
-                .map(|record| record.memory_id.clone())
-                .collect(),
-        })),
+                .filter(|record| !record.deleted)
+                .map(|record| record.memory_id.as_str());
+            if let Err(error) =
+                evict_over_cap(&state, &caller.user_id, new_next_seq, live, pushed_live).await
+            {
+                tracing::error!(%error, user_id = %caller.user_id, "cap eviction failed");
+            }
+            Ok(Json(PushResponse {
+                applied: newer
+                    .iter()
+                    .map(|record| record.memory_id.clone())
+                    .collect(),
+            }))
+        }
         // Another push for this user wrote between the reads and this write, or the account is
         // being deleted.
         Err(TransactError::ConditionFailed(_)) => Err(ApiError::Conflict),
@@ -698,85 +732,237 @@ fn check_record(record: &Record, device_id: &str) -> Result<(), &'static str> {
 struct StoredVersion {
     hlc: String,
     deleted: bool,
+    /// Set only on a live memory.
+    evict_key: Option<String>,
 }
 
-/// The stored `hlc` of each pushed memory that the user already has.
-async fn stored_versions(
+/// The stored version of each of these memories that the user has, read strongly consistent.
+async fn stored_versions<'a>(
     state: &AppState,
     user_id: &str,
-    records: &[Record],
+    memory_ids: impl IntoIterator<Item = &'a str>,
 ) -> Result<HashMap<String, StoredVersion>, ApiError> {
     let table = &state.config.memories_table;
+    let ids: Vec<&str> = memory_ids.into_iter().collect();
     let mut versions = HashMap::new();
-    let mut keys = KeysAndAttributes::builder()
-        .consistent_read(true)
-        .projection_expression("memory_id, hlc, deleted")
-        .set_keys(Some(
-            records
-                .iter()
-                .map(|record| {
-                    HashMap::from([
-                        ("user_id".to_owned(), AttributeValue::S(user_id.to_owned())),
-                        (
-                            "memory_id".to_owned(),
-                            AttributeValue::S(record.memory_id.clone()),
-                        ),
-                    ])
-                })
-                .collect(),
-        ))
+    for chunk in ids.chunks(BATCH_GET_KEYS) {
+        let mut keys = KeysAndAttributes::builder()
+            .consistent_read(true)
+            .projection_expression("memory_id, hlc, deleted, evict_key")
+            .set_keys(Some(
+                chunk
+                    .iter()
+                    .map(|memory_id| {
+                        HashMap::from([
+                            ("user_id".to_owned(), AttributeValue::S(user_id.to_owned())),
+                            (
+                                "memory_id".to_owned(),
+                                AttributeValue::S((*memory_id).to_owned()),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ))
+            .build()
+            .map_err(internal)?;
+        loop {
+            let output = state
+                .dynamo
+                .batch_get_item()
+                .request_items(table, keys)
+                .send()
+                .await
+                .map_err(|error| internal(DisplayErrorContext(error)))?;
+            for item in output
+                .responses
+                .and_then(|mut tables| tables.remove(table))
+                .into_iter()
+                .flatten()
+            {
+                let deleted = item
+                    .get("deleted")
+                    .is_some_and(|value| value.as_bool() == Ok(&true));
+                let evict_key = match item.get("evict_key") {
+                    None => None,
+                    Some(_) => Some(attribute_s(&item, "evict_key")?.to_owned()),
+                };
+                versions.insert(
+                    attribute_s(&item, "memory_id")?.to_owned(),
+                    StoredVersion {
+                        hlc: attribute_s(&item, "hlc")?.to_owned(),
+                        deleted,
+                        evict_key,
+                    },
+                );
+            }
+            // DynamoDB can return part of a batch; the rest comes back as unprocessed keys.
+            match output
+                .unprocessed_keys
+                .and_then(|mut tables| tables.remove(table))
+            {
+                Some(rest) if !rest.keys().is_empty() => keys = rest,
+                _ => break,
+            }
+        }
+    }
+    Ok(versions)
+}
+
+/// Sets the user's `next_seq` to `new` and moves `live_count` by `live_delta`, if no other write
+/// moved `next_seq` from `old`.
+fn user_update(
+    state: &AppState,
+    user_id: &str,
+    old: i64,
+    new: i64,
+    live_delta: i64,
+) -> Result<TransactWriteItem, ApiError> {
+    let update = Update::builder()
+        .table_name(&state.config.users_table)
+        .key("user_id", AttributeValue::S(user_id.to_owned()))
+        .update_expression("SET next_seq = :new, live_count = live_count + :delta")
+        // A write that passed auth just before an account deletion must not write rows that the
+        // purge has already listed.
+        .condition_expression("next_seq = :old AND attribute_not_exists(deleting)")
+        .expression_attribute_values(":old", AttributeValue::N(old.to_string()))
+        .expression_attribute_values(":new", AttributeValue::N(new.to_string()))
+        .expression_attribute_values(":delta", AttributeValue::N(live_delta.to_string()))
         .build()
         .map_err(internal)?;
-    loop {
-        let output = state
-            .dynamo
-            .batch_get_item()
-            .request_items(table, keys)
-            .send()
-            .await
-            .map_err(|error| internal(DisplayErrorContext(error)))?;
-        for item in output
-            .responses
-            .and_then(|mut tables| tables.remove(table))
-            .into_iter()
-            .flatten()
-        {
-            let deleted = item
-                .get("deleted")
-                .is_some_and(|value| value.as_bool() == Ok(&true));
-            versions.insert(
-                attribute_s(&item, "memory_id")?.to_owned(),
-                StoredVersion {
-                    hlc: attribute_s(&item, "hlc")?.to_owned(),
-                    deleted,
-                },
-            );
-        }
-        // DynamoDB can return part of a batch; the rest comes back as unprocessed keys.
-        match output
-            .unprocessed_keys
-            .and_then(|mut tables| tables.remove(table))
-        {
-            Some(rest) if !rest.keys().is_empty() => keys = rest,
-            _ => return Ok(versions),
-        }
+    Ok(TransactWriteItem::builder().update(update).build())
+}
+
+#[derive(Debug, Error)]
+enum EvictError {
+    #[error("other writes changed the user or its oldest memories on every try")]
+    Contended,
+    #[error("a storage request failed")]
+    Storage,
+}
+
+/// `internal` has logged the cause.
+impl From<ApiError> for EvictError {
+    fn from(_: ApiError) -> Self {
+        Self::Storage
     }
 }
 
-async fn next_seq(state: &AppState, user_id: &str) -> Result<i64, ApiError> {
+/// Tombstones the user's oldest live memories, in `evict_key` order, until the user is at the
+/// cap. One push adds at most `MAX_PUSH_RECORDS` live memories, so one batch of that size brings
+/// the user back to the cap; a backlog left by a failed eviction shrinks with each push.
+///
+/// The index is eventually consistent, so it only names candidates: memories that the last
+/// eviction removed can still head it, and this push's records can still have their old
+/// `evict_key`. The choice comes from a strongly consistent read of `MAX_PUSH_RECORDS` more rows
+/// than needed, which covers one earlier batch, and of this push's live records.
+async fn evict_over_cap<'a>(
+    state: &AppState,
+    user_id: &str,
+    mut next_seq: i64,
+    mut live: i64,
+    pushed_live: impl IntoIterator<Item = &'a str>,
+) -> Result<(), EvictError> {
+    let pushed_live: Vec<&str> = pushed_live.into_iter().collect();
+    for _ in 0..TRANSACTION_TRIES {
+        let excess = live - state.config.memory_cap;
+        if excess <= 0 {
+            return Ok(());
+        }
+        let excess = excess.min(MAX_PUSH_RECORDS as i64) as usize;
+        let index = state
+            .dynamo
+            .query()
+            .table_name(&state.config.memories_table)
+            .index_name("by_evict_key")
+            .key_condition_expression("user_id = :user")
+            .expression_attribute_values(":user", AttributeValue::S(user_id.to_owned()))
+            .limit((excess + MAX_PUSH_RECORDS) as i32)
+            .send()
+            .await
+            .map_err(|error| internal(DisplayErrorContext(error)))?;
+        let mut candidates: HashSet<&str> = pushed_live.iter().copied().collect();
+        for item in index.items() {
+            candidates.insert(attribute_s(item, "memory_id")?);
+        }
+        let versions = stored_versions(state, user_id, candidates).await?;
+        let chosen = oldest_live(versions, excess);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(internal)?
+            .as_millis() as u64;
+        let mut items = Vec::with_capacity(chosen.len() + 1);
+        for (seq, (memory_id, version)) in (next_seq + 1..).zip(&chosen) {
+            // A device applies only a newer stamp, so the tombstone must sort after the stored
+            // one even when the device clock is ahead of this one.
+            let mut clock = Hlc::new(SERVER_WRITER);
+            clock.observe(&version.hlc).map_err(internal)?;
+            let tombstone = Record {
+                user_id: None,
+                memory_id: memory_id.clone(),
+                seq: None,
+                hlc: clock.tick(now_ms),
+                writer: SERVER_WRITER.to_owned(),
+                record_type: None,
+                kind: None,
+                scope: None,
+                project_id: None,
+                text: None,
+                created_at: None,
+                superseded_by: None,
+                deleted: true,
+                evict_key: None,
+            };
+            // The put fails if another push changed the memory since the read.
+            items.push(memory_put(state, user_id, seq, &tombstone, Some(version))?);
+        }
+        let evicted = items.len() as i64;
+        items.insert(
+            0,
+            user_update(state, user_id, next_seq, next_seq + evicted, -evicted)?,
+        );
+        match transact(state, items).await {
+            Ok(()) => return Ok(()),
+            Err(TransactError::ConditionFailed(_)) => {
+                (next_seq, live) = user_counters(state, user_id).await?;
+            }
+            Err(TransactError::Storage(_)) => return Err(EvictError::Storage),
+        }
+    }
+    Err(EvictError::Contended)
+}
+
+/// The `count` live versions that come first in `evict_key` order.
+fn oldest_live(
+    versions: HashMap<String, StoredVersion>,
+    count: usize,
+) -> Vec<(String, StoredVersion)> {
+    let mut live: Vec<(String, StoredVersion)> = versions
+        .into_iter()
+        .filter(|(_, version)| version.evict_key.is_some())
+        .collect();
+    live.sort_unstable_by(|(a_id, a), (b_id, b)| (&a.evict_key, a_id).cmp(&(&b.evict_key, b_id)));
+    live.truncate(count);
+    live
+}
+
+/// The user's `next_seq` and `live_count`.
+async fn user_counters(state: &AppState, user_id: &str) -> Result<(i64, i64), ApiError> {
     let user = state
         .dynamo
         .get_item()
         .table_name(&state.config.users_table)
         .key("user_id", AttributeValue::S(user_id.to_owned()))
         .consistent_read(true)
-        .projection_expression("next_seq")
+        .projection_expression("next_seq, live_count")
         .send()
         .await
         .map_err(|error| internal(DisplayErrorContext(error)))?
         .item
         .ok_or_else(|| internal("authenticated user has no user item"))?;
-    user_number(&user, "next_seq")
+    Ok((
+        user_number(&user, "next_seq")?,
+        user_number(&user, "live_count")?,
+    ))
 }
 
 fn user_number(user: &Item, name: &str) -> Result<i64, ApiError> {
@@ -1192,6 +1378,49 @@ mod tests {
             superseded_by: None,
             deleted: true,
             evict_key: None,
+        }
+    }
+
+    #[test]
+    fn eviction_takes_the_oldest_live_versions_that_the_read_returned() {
+        let version = |hlc: &str, evict_key: Option<&str>| StoredVersion {
+            hlc: hlc.to_owned(),
+            deleted: evict_key.is_none(),
+            evict_key: evict_key.map(str::to_owned),
+        };
+        let versions = HashMap::from([
+            // The index still lists it, but the last eviction made it a tombstone.
+            ("evicted".to_owned(), version("h1", None)),
+            ("episode".to_owned(), version("h2", Some("2#1761750000000"))),
+            // This push replaced it; the index can still show it as an other fact.
+            (
+                "replaced".to_owned(),
+                version("h3", Some("1#1761750009000")),
+            ),
+            ("fact".to_owned(), version("h4", Some("3#1761750000000"))),
+        ]);
+        let chosen: Vec<(String, String)> = oldest_live(versions, 2)
+            .into_iter()
+            .map(|(id, version)| (id, version.hlc))
+            .collect();
+        assert_eq!(
+            chosen,
+            [
+                ("replaced".to_owned(), "h3".to_owned()),
+                ("episode".to_owned(), "h2".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn the_memory_cap_defaults_to_50_000_and_must_be_a_positive_number() {
+        assert_eq!(memory_cap(None).unwrap(), 50_000);
+        assert_eq!(memory_cap(Some("5")).unwrap(), 5);
+        for bad in ["0", "-1", "5k", ""] {
+            assert!(matches!(
+                memory_cap(Some(bad)),
+                Err(EnvError::Invalid("MEMORY_CAP"))
+            ));
         }
     }
 

@@ -29,25 +29,49 @@ pub const SLOW: &str = "gho_slow";
 
 pub type Item = HashMap<String, AttributeValue>;
 
+/// The cap the service has when `MEMORY_CAP` is not set.
+pub const DEFAULT_CAP: i64 = 50_000;
+
 pub struct Service {
     pub router: Router,
     pub dynamo: Client,
     pub users_table: String,
     pub devices_table: String,
     pub memories_table: String,
+    pub github_api_url: String,
 }
 
 impl Service {
     pub async fn start() -> Self {
-        Self::start_with_tables(true).await
+        Self::start_with(true, DEFAULT_CAP).await
+    }
+
+    /// A service that keeps at most `cap` live memories for each user.
+    pub async fn start_with_cap(cap: i64) -> Self {
+        Self::start_with(true, cap).await
     }
 
     /// A service whose tables were never created, so every write fails.
     pub async fn without_tables() -> Self {
-        Self::start_with_tables(false).await
+        Self::start_with(false, DEFAULT_CAP).await
     }
 
-    async fn start_with_tables(create: bool) -> Self {
+    /// The same tables served with another cap.
+    pub fn set_cap(&mut self, cap: i64) {
+        self.router = router(AppState::new(self.dynamo.clone(), self.config(cap)));
+    }
+
+    fn config(&self, memory_cap: i64) -> Config {
+        Config {
+            users_table: self.users_table.clone(),
+            devices_table: self.devices_table.clone(),
+            memories_table: self.memories_table.clone(),
+            github_api_url: self.github_api_url.clone(),
+            memory_cap,
+        }
+    }
+
+    async fn start_with(create: bool, cap: i64) -> Self {
         let endpoint = std::env::var("DYNAMODB_ENDPOINT")
             .unwrap_or_else(|_| "http://localhost:8000".to_owned());
         let dynamo = local_dynamo(&endpoint).await;
@@ -58,19 +82,16 @@ impl Service {
         if create {
             create_tables(&dynamo, &users_table, &devices_table, &memories_table).await;
         }
-        let config = Config {
-            users_table: users_table.clone(),
-            devices_table: devices_table.clone(),
-            memories_table: memories_table.clone(),
-            github_api_url: fake_github().await,
-        };
-        Self {
-            router: router(AppState::new(dynamo.clone(), config)),
+        let mut service = Self {
+            router: Router::new(),
             dynamo,
             users_table,
             devices_table,
             memories_table,
-        }
+            github_api_url: fake_github().await,
+        };
+        service.set_cap(cap);
+        service
     }
 
     pub async fn post(&self, path: &str, body: impl Into<Body>) -> (StatusCode, serde_json::Value) {
@@ -216,12 +237,30 @@ async fn create_tables(dynamo: &Client, users: &str, devices: &str, memories: &s
         )
         .build()
         .unwrap();
+    let by_evict_key = GlobalSecondaryIndex::builder()
+        .index_name("by_evict_key")
+        .key_schema(hash_key("user_id"))
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("evict_key")
+                .key_type(KeyType::Range)
+                .build()
+                .unwrap(),
+        )
+        .projection(
+            Projection::builder()
+                .projection_type(ProjectionType::KeysOnly)
+                .build(),
+        )
+        .build()
+        .unwrap();
     dynamo
         .create_table()
         .table_name(memories)
         .billing_mode(BillingMode::PayPerRequest)
         .attribute_definitions(string("user_id"))
         .attribute_definitions(string("memory_id"))
+        .attribute_definitions(string("evict_key"))
         .attribute_definitions(
             AttributeDefinition::builder()
                 .attribute_name("seq")
@@ -237,6 +276,7 @@ async fn create_tables(dynamo: &Client, users: &str, devices: &str, memories: &s
                 .build()
                 .unwrap(),
         )
+        .global_secondary_indexes(by_evict_key)
         .local_secondary_indexes(by_seq)
         .send()
         .await
@@ -278,6 +318,36 @@ async fn fake_github() -> String {
             .unwrap();
     });
     url
+}
+
+pub async fn get_item(service: &Service, table: &str, key: &[(&str, &str)]) -> Option<Item> {
+    let mut request = service
+        .dynamo
+        .get_item()
+        .table_name(table)
+        .consistent_read(true);
+    for (name, value) in key {
+        request = request.key(*name, AttributeValue::S((*value).to_owned()));
+    }
+    request.send().await.unwrap().item
+}
+
+pub async fn memory(service: &Service, user_id: &str, memory_id: &str) -> Option<Item> {
+    get_item(
+        service,
+        &service.memories_table,
+        &[("user_id", user_id), ("memory_id", memory_id)],
+    )
+    .await
+}
+
+/// The user's `next_seq` and `live_count`.
+pub async fn counters(service: &Service, user_id: &str) -> (i64, i64) {
+    let user = get_item(service, &service.users_table, &[("user_id", user_id)])
+        .await
+        .unwrap();
+    let n = |name: &str| user[name].as_n().unwrap().parse().unwrap();
+    (n("next_seq"), n("live_count"))
 }
 
 pub fn string(item: &Item, name: &str) -> String {

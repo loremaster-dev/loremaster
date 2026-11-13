@@ -2,42 +2,12 @@
 
 mod common;
 
-use aws_sdk_dynamodb::types::AttributeValue;
 use axum::http::StatusCode;
 use common::{
-    ALICE, BOB, BOB_ID, Item, PUSH, Service, alice, device, fact, hlc, push, push_ok, string,
-    tombstone,
+    ALICE, BOB, BOB_ID, Item, PUSH, Service, alice, counters, device, fact, hlc, memory, push,
+    push_ok, string, tombstone,
 };
 use serde_json::{Value, json};
-
-async fn get(service: &Service, table: &str, key: &[(&str, &str)]) -> Option<Item> {
-    let mut request = service
-        .dynamo
-        .get_item()
-        .table_name(table)
-        .consistent_read(true);
-    for (name, value) in key {
-        request = request.key(*name, AttributeValue::S((*value).to_owned()));
-    }
-    request.send().await.unwrap().item
-}
-
-async fn memory(service: &Service, user_id: &str, memory_id: &str) -> Option<Item> {
-    get(
-        service,
-        &service.memories_table,
-        &[("user_id", user_id), ("memory_id", memory_id)],
-    )
-    .await
-}
-
-async fn counters(service: &Service, user_id: &str) -> (i64, i64) {
-    let user = get(service, &service.users_table, &[("user_id", user_id)])
-        .await
-        .unwrap();
-    let n = |name: &str| user[name].as_n().unwrap().parse().unwrap();
-    (n("next_seq"), n("live_count"))
-}
 
 fn seq(item: &Item) -> i64 {
     item["seq"].as_n().unwrap().parse().unwrap()
