@@ -146,11 +146,11 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
       - New home → `loremaster status` shows the recallable count rising towards `total`.
       - Recall probe mid-bootstrap → returns matches from loaded rows. Stop hook mid-bootstrap → turn in `turn_queue`.
       - Kill the daemon mid-bootstrap, restart → resumes from the saved cursor, ends with 5,000 rows, no duplicates.
-  - F7. 50k cap: server evicts the oldest over the cap, in class order. Docs: tasks. Needs: F1, F3. Status: not started.
+  - F7. 50k cap: server evicts the oldest over the cap, in class order. Docs: design, tasks. Needs: F1, F3. Status: done.
     - Verify (Local):
       - 50,000 live + 1 new, with one replaced fact, one episode, one other fact → oldest replaced fact tombstoned, `writer` = `server`, `live_count` = 50,000.
-      - No replaced facts left → oldest episode evicted. No episodes left → oldest other fact evicted.
-      - 49,999 live + 1 new → nothing evicted (FR32).
+      - Cap 5 (`MEMORY_CAP`): no replaced facts left → oldest episode evicted. No episodes left → oldest other fact evicted.
+      - Cap 5: 4 live + 1 new → nothing evicted (FR32).
       - Device pulls an eviction → recall probe no longer returns it. No user-visible message.
 - Status: not started.
 

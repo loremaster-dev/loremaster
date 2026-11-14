@@ -26,6 +26,7 @@ fn state(service: &Service) -> AppState {
         devices_table: service.devices_table.clone(),
         memories_table: service.memories_table.clone(),
         github_api_url: "http://127.0.0.1:9".to_owned(),
+        memory_cap: common::DEFAULT_CAP,
     };
     AppState::new(service.dynamo.clone(), config)
 }

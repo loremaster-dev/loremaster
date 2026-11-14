@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use fastembed::{
@@ -152,6 +153,10 @@ fn download(
 /// The loaded model. One instance is shared; ONNX inference needs exclusive access.
 pub struct Embedder {
     model: Mutex<TextEmbedding>,
+    /// Callers blocked on `model`.
+    waiting: AtomicUsize,
+    /// How many times a caller has taken `model`.
+    taken: AtomicUsize,
 }
 
 impl Embedder {
@@ -171,6 +176,8 @@ impl Embedder {
                 .map_err(|e| EmbedError::Model(e.to_string()))?;
         let embedder = Self {
             model: Mutex::new(model),
+            waiting: AtomicUsize::new(0),
+            taken: AtomicUsize::new(0),
         };
         // The first inference is by far the slowest. Taking it here keeps it from using up the
         // deadline of the user's first prompt.
@@ -183,15 +190,19 @@ impl Embedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let vectors = self
-            .model
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        let mut model = self.model.lock().unwrap_or_else(|e| e.into_inner());
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
+        let mine = self.taken.fetch_add(1, Ordering::SeqCst) + 1;
+        let vectors = model
             .embed(texts, None)
             .map_err(|e| EmbedError::Model(e.to_string()));
+        drop(model);
         // The lock is not fair: a caller that embeds in a loop would take it back before a waiting
-        // prompt wakes up. Yielding lets the prompt in between texts.
-        std::thread::yield_now();
+        // prompt wakes up. So hand the lock over: return only after a waiting caller has taken it.
+        while self.waiting.load(Ordering::SeqCst) > 0 && self.taken.load(Ordering::SeqCst) == mine {
+            std::thread::yield_now();
+        }
         vectors
     }
 }
