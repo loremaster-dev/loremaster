@@ -21,7 +21,7 @@ fn store_with(memories: &[StoredMemory]) -> (Sandbox, Store) {
 fn recall_with(memories: &[StoredMemory]) -> (Sandbox, Recall) {
     let (sandbox, store) = store_with(memories);
     let recall = Recall::new(store).unwrap();
-    recall.set_embedder(embedder()).unwrap();
+    recall.set_embedder(embedder(), None).unwrap();
     (sandbox, recall)
 }
 
@@ -405,7 +405,7 @@ fn memories_from_another_model_are_excluded_until_re_embedded() {
     let id = old.record.memory_id.clone();
     let (sandbox, store) = store_with(&[old, deleted]);
     let recall = Recall::new(store).unwrap();
-    recall.set_embedder(embedder()).unwrap();
+    recall.set_embedder(embedder(), None).unwrap();
     let output = recall
         .for_prompt_delivered("s1", WEB, "how do we deploy?", now_ms())
         .unwrap();

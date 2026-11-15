@@ -11,6 +11,9 @@ use crate::store::StoredMemory;
 /// Embedding dimensions of the pinned model.
 pub const DIMENSIONS: usize = 384;
 
+/// Two facts at least this similar say the same thing.
+pub const DUPLICATE_SIMILARITY: f32 = 0.95;
+
 /// A vector of the wrong length.
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("vector has {got} dimensions, expected {expected}")]
@@ -119,10 +122,48 @@ impl Index {
                 memory_id: &row.memory_id,
                 record_type: row.record_type,
                 created_at: row.created_at,
-                score: vector.iter().zip(query).map(|(a, b)| a * b).sum(),
+                score: dot(vector, query),
             })
             .collect()
     }
+
+    /// The other live facts that say the same thing as the live fact `memory_id`: as similar as
+    /// `DUPLICATE_SIMILARITY`, in the same scope and, for project scope, the same project.
+    pub fn near_duplicates(&self, memory_id: &str) -> Vec<&str> {
+        let Some(&position) = self.positions.get(memory_id) else {
+            return Vec::new();
+        };
+        let fact = &self.rows[position];
+        let is_live_fact = |row: &Row| row.live && row.record_type == Some(RecordType::Fact);
+        let same_scope = |row: &Row| match fact.scope {
+            Some(Scope::User) => row.scope == Some(Scope::User),
+            Some(Scope::Project) => {
+                row.scope == Some(Scope::Project) && row.project_id == fact.project_id
+            }
+            None => false,
+        };
+        if !is_live_fact(fact) {
+            return Vec::new();
+        }
+        let vectors = self.vectors.as_chunks::<DIMENSIONS>().0;
+        let vector = &vectors[position];
+        self.rows
+            .iter()
+            .zip(vectors)
+            .enumerate()
+            .filter(|&(other, (row, other_vector))| {
+                other != position
+                    && is_live_fact(row)
+                    && same_scope(row)
+                    && dot(vector, other_vector) >= DUPLICATE_SIMILARITY
+            })
+            .map(|(_, (row, _))| row.memory_id.as_str())
+            .collect()
+    }
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(a, b)| a * b).sum()
 }
 
 #[cfg(test)]
@@ -262,6 +303,66 @@ mod tests {
         let mut index = Index::new(MODEL);
         index.insert(&row).unwrap();
         assert!(index.search(&unit(0), "p").is_empty());
+    }
+
+    /// A unit vector with `similarity` to `unit(0)`, the rest on axis `other`.
+    fn toward(similarity: f32, other: usize) -> Vec<f32> {
+        let mut vector = unit(0);
+        vector[0] = similarity;
+        vector[other] = (1.0 - similarity * similarity).sqrt();
+        vector
+    }
+
+    fn duplicates(index: &Index, memory_id: &str) -> Vec<String> {
+        let mut ids: Vec<String> = index
+            .near_duplicates(memory_id)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn near_duplicates_are_live_facts_at_the_threshold_in_the_same_scope() {
+        let mut close = memory("close", None);
+        close.vector = Some(toward(0.96, 1));
+        let mut far = memory("far", None);
+        far.vector = Some(toward(0.94, 2));
+        let mut episode = memory("episode", None);
+        episode.record.record_type = Some(RecordType::Episode);
+        let mut unscoped = memory("unscoped", None);
+        unscoped.record.scope = None;
+        let mut index = sample_index();
+        for row in [close, far, episode, unscoped, memory("gone", None)] {
+            index.insert(&row).unwrap();
+        }
+        index.mark_not_live("gone");
+
+        assert_eq!(duplicates(&index, "A"), ["close"]);
+        assert_eq!(duplicates(&index, "close"), ["A"]);
+        assert!(duplicates(&index, "B").is_empty());
+        assert!(duplicates(&index, "unscoped").is_empty());
+        assert!(duplicates(&index, "unknown").is_empty());
+    }
+
+    #[test]
+    fn project_facts_are_duplicates_only_in_the_same_project() {
+        let mut index = sample_index();
+        index.insert(&memory("B2", Some("github.com/a/x"))).unwrap();
+        assert_eq!(duplicates(&index, "B"), ["B2"]);
+        assert!(duplicates(&index, "C").is_empty());
+    }
+
+    #[test]
+    fn a_memory_that_is_not_a_live_fact_has_no_duplicates() {
+        let mut episode = memory("episode", None);
+        episode.record.record_type = Some(RecordType::Episode);
+        let mut index = sample_index();
+        index.insert(&episode).unwrap();
+        for id in ["D", "E", "episode"] {
+            assert!(duplicates(&index, id).is_empty(), "{id}");
+        }
     }
 
     #[cfg(not(debug_assertions))]

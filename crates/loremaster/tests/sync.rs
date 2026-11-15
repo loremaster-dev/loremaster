@@ -152,7 +152,7 @@ fn pull_pages_until_done_and_embeds_what_it_stores() {
         .collect();
     fake.insert(USER, &records);
     let (recall, mut client) = client(&sandbox);
-    recall.set_embedder(embedder()).unwrap();
+    recall.set_embedder(embedder(), None).unwrap();
 
     assert_eq!(client.pull().unwrap(), 25);
 
@@ -205,7 +205,7 @@ fn an_older_pulled_change_is_ignored_and_a_tombstone_leaves_recall() {
         .put_memories(&[kept.clone(), gone.clone()])
         .unwrap();
     let (recall, mut client) = client(&sandbox);
-    recall.set_embedder(embedder).unwrap();
+    recall.set_embedder(embedder, None).unwrap();
     assert!(prompt(&recall, "how do we deploy?").is_some());
 
     let older = Record {
@@ -261,7 +261,7 @@ fn rows_pulled_before_the_model_loads_get_vectors_when_it_does() {
         .unwrap();
     assert_eq!((stored.vector, stored.model_id), (None, None));
 
-    recall.set_embedder(embedder()).unwrap();
+    recall.set_embedder(embedder(), None).unwrap();
     let stored = sandbox
         .store()
         .get_memory(&record.memory_id)
@@ -633,7 +633,9 @@ impl Home {
         let (sandbox, device) = home(fake, sandbox);
         let (recall, client) = client(&sandbox);
         if with_model {
-            recall.set_embedder(embedder()).unwrap();
+            recall
+                .set_embedder(embedder(), Some(&device.device_id))
+                .unwrap();
         }
         Self {
             sandbox,
@@ -877,7 +879,7 @@ fn bootstrap_fake() -> (FakeService, Vec<Record>) {
 
 fn embedded_client(sandbox: &Sandbox) -> (Arc<Recall>, SyncClient) {
     let (recall, client) = client(sandbox);
-    recall.set_embedder(embedder()).unwrap();
+    recall.set_embedder(embedder(), None).unwrap();
     (recall, client)
 }
 
@@ -920,4 +922,219 @@ fn recall_uses_the_pages_loaded_so_far() {
     client.pull().unwrap();
     let packages = prompt(&recall, "which package manager should I use?").unwrap_or_default();
     assert!(packages.contains("pnpm"), "{packages}");
+}
+
+/// Two new ids, the smaller first.
+fn ordered_ids() -> (String, String) {
+    let (mut first, mut second) = (new_ulid(), new_ulid());
+    if second < first {
+        std::mem::swap(&mut first, &mut second);
+    }
+    (first, second)
+}
+
+/// A local fact with its vector, as `dev seed` writes it.
+fn embedded(model: &loremaster::embed::Embedder, memory_id: &str, text: &str) -> StoredMemory {
+    let mut memory = fact(text);
+    memory.record.memory_id = memory_id.to_owned();
+    memory.vector = model.embed(&[text]).unwrap().pop();
+    memory.model_id = Some(MODEL_ID.to_owned());
+    memory
+}
+
+fn pulled(memory_id: &str, text: &str) -> Record {
+    Record {
+        memory_id: memory_id.to_owned(),
+        ..remote(text, 1_761_750_000_000)
+    }
+}
+
+impl Home {
+    /// Ids in the outbox, sorted.
+    fn queued(&self) -> Vec<String> {
+        let store = self.sandbox.store();
+        let mut ids: Vec<String> = store
+            .outbox_batch(100)
+            .unwrap()
+            .into_iter()
+            .map(|memory| memory.record.memory_id)
+            .collect();
+        ids.sort();
+        ids
+    }
+}
+
+const DEPLOY: &str = "Deploys go through ArgoCD, not manual kubectl";
+
+#[test]
+fn a_pulled_duplicate_with_the_larger_id_is_tombstoned_here() {
+    let fake = FakeService::start(100);
+    let mut a = Home::new(&fake, true);
+    let (local, remote_id) = ordered_ids();
+    a.write(&mut [embedded(&embedder(), &local, DEPLOY)]);
+    a.push();
+    fake.insert(USER, &[pulled(&remote_id, DEPLOY)]);
+    a.pull();
+
+    assert!(a.stored(&remote_id).deleted);
+    assert!(!a.stored(&local).deleted);
+    assert_eq!(a.queued(), [remote_id]);
+    let reply = prompt(&a.recall, "how do we deploy?").unwrap();
+    assert_eq!(reply.matches("ArgoCD").count(), 1, "{reply}");
+}
+
+#[test]
+fn a_local_duplicate_with_the_larger_id_is_tombstoned_here() {
+    let fake = FakeService::start(100);
+    let mut a = Home::new(&fake, true);
+    let (remote_id, local) = ordered_ids();
+    a.write(&mut [embedded(&embedder(), &local, DEPLOY)]);
+    a.push();
+    fake.insert(USER, &[pulled(&remote_id, DEPLOY)]);
+    a.pull();
+
+    assert!(a.stored(&local).deleted);
+    assert!(!a.stored(&remote_id).deleted);
+    assert_eq!(a.queued(), [local]);
+}
+
+#[test]
+fn two_pulled_duplicates_in_one_page_keep_the_smaller_id() {
+    let fake = FakeService::start(100);
+    let mut a = Home::new(&fake, true);
+    let (smaller, larger) = ordered_ids();
+    fake.insert(USER, &[pulled(&larger, DEPLOY), pulled(&smaller, DEPLOY)]);
+    a.pull();
+
+    assert!(a.stored(&larger).deleted);
+    assert!(!a.stored(&smaller).deleted);
+    assert_eq!(a.queued(), [larger]);
+}
+
+#[test]
+fn facts_in_other_scopes_projects_or_types_and_unrelated_facts_stay_live() {
+    let fake = FakeService::start(100);
+    let mut a = Home::new(&fake, true);
+    let model = embedder();
+    let in_project = |memory: &mut Record, project: &str| {
+        memory.scope = Some(Scope::Project);
+        memory.project_id = Some(project.to_owned());
+    };
+    let user_fact = embedded(&model, &new_ulid(), "Prefers pnpm over npm");
+    let mut project_fact = embedded(&model, &new_ulid(), "Tests run with cargo nextest");
+    in_project(&mut project_fact.record, "github.com/a/x");
+    let mut episode = embedded(&model, &new_ulid(), "Moved the deploy to ArgoCD");
+    episode.record.record_type = Some(RecordType::Episode);
+    episode.record.kind = None;
+    let unrelated = embedded(&model, &new_ulid(), DEPLOY);
+    let mut local = [user_fact, project_fact, episode, unrelated];
+    a.write(&mut local);
+    a.push();
+
+    let mut same_text_project = pulled(&new_ulid(), "Prefers pnpm over npm");
+    in_project(&mut same_text_project, "github.com/a/x");
+    let mut other_project = pulled(&new_ulid(), "Tests run with cargo nextest");
+    in_project(&mut other_project, "github.com/a/y");
+    let records = [
+        same_text_project,
+        other_project,
+        pulled(&new_ulid(), "Moved the deploy to ArgoCD"),
+        pulled(&new_ulid(), "The capital of France is Paris"),
+    ];
+    fake.insert(USER, &records);
+    a.pull();
+
+    for id in local
+        .iter()
+        .map(|memory| &memory.record.memory_id)
+        .chain(records.iter().map(|record| &record.memory_id))
+    {
+        assert!(!a.stored(id).deleted, "{id}");
+    }
+    assert!(a.queued().is_empty());
+}
+
+#[test]
+fn a_duplicate_pulled_before_the_model_loads_is_tombstoned_when_it_loads() {
+    for logged_in in [true, false] {
+        let fake = FakeService::start(100);
+        let (sandbox, device) = home(&fake, Sandbox::with_model());
+        let (recall, mut client) = client(&sandbox);
+        let model = embedder();
+        let (local, remote_id) = ordered_ids();
+        write_local(&sandbox, &device, &mut [embedded(&model, &local, DEPLOY)]);
+        client.push_outbox().unwrap();
+        fake.insert(USER, &[pulled(&remote_id, DEPLOY)]);
+        client.pull().unwrap();
+        assert_eq!(outbox(&sandbox), 0);
+
+        let writer = logged_in.then_some(device.device_id.as_str());
+        recall.set_embedder(model, writer).unwrap();
+        let deleted = |id: &str| {
+            let memory = sandbox.store().get_memory(id).unwrap().unwrap();
+            memory.record.deleted
+        };
+        assert!(!deleted(&local));
+        assert_eq!(deleted(&remote_id), logged_in, "logged in: {logged_in}");
+        assert_eq!(outbox(&sandbox), i64::from(logged_in));
+    }
+}
+
+#[test]
+fn a_daemon_removes_a_duplicate_when_its_model_loads_and_pushes_the_tombstone() {
+    let fake = FakeService::start(100);
+    let (sandbox, _device) = home(&fake, Sandbox::with_model());
+    let (local, duplicate) = ordered_ids();
+    let mut unembedded = fact(DEPLOY);
+    unembedded.record = pulled(&duplicate, DEPLOY);
+    let store = sandbox.store();
+    store
+        .put_memories(&[embedded(&embedder(), &local, DEPLOY), unembedded])
+        .unwrap();
+    drop(store);
+
+    let _daemon = sandbox.start_daemon();
+    sandbox.wait_for_embedder();
+    wait_for(
+        || {
+            fake.records(USER)
+                .iter()
+                .any(|record| record.memory_id == duplicate && record.deleted)
+        },
+        "tombstone pushed",
+    );
+    let stored = |id: &str| sandbox.store().get_memory(id).unwrap().unwrap().record;
+    assert!(stored(&duplicate).deleted);
+    assert!(!stored(&local).deleted);
+}
+
+#[test]
+fn the_same_fact_from_two_devices_ends_as_one_on_both() {
+    let fake = FakeService::start(100);
+    let (mut a, mut b) = (Home::new(&fake, true), Home::new(&fake, true));
+    let model = embedder();
+    let (smaller, larger) = ordered_ids();
+    a.write(&mut [embedded(&model, &larger, DEPLOY)]);
+    b.write(&mut [embedded(&model, &smaller, DEPLOY)]);
+
+    for _ in 0..2 {
+        a.push();
+        b.push();
+        a.pull();
+        b.pull();
+    }
+
+    for home in [&a, &b] {
+        assert!(!home.stored(&smaller).deleted);
+        assert!(home.stored(&larger).deleted);
+        assert_eq!(outbox(&home.sandbox), 0);
+    }
+    let on_service: Vec<(String, bool)> = fake
+        .records(USER)
+        .into_iter()
+        .map(|record| (record.memory_id, record.deleted))
+        .collect();
+    assert_eq!(on_service.len(), 2);
+    assert!(on_service.contains(&(smaller, false)));
+    assert!(on_service.contains(&(larger, true)));
 }
