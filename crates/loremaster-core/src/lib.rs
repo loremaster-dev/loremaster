@@ -66,7 +66,7 @@ impl Hlc {
         } else {
             self.counter += 1;
         }
-        format!("{:013}-{:05}-{}", self.wall_ms, self.counter, self.writer)
+        self.to_string()
     }
 
     /// Moves the clock past a stamp seen from another writer, so later ticks sort after it.
@@ -77,6 +77,17 @@ impl Hlc {
             self.counter = remote.counter;
         }
         Ok(())
+    }
+}
+
+/// The fixed-width string form of the last stamp made or observed.
+impl std::fmt::Display for Hlc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:013}-{:05}-{}",
+            self.wall_ms, self.counter, self.writer
+        )
     }
 }
 
@@ -226,6 +237,17 @@ pub struct Candidate {
     pub kind: Kind,
 }
 
+/// One page of `GET /v1/sync/pull`: records with a `seq` above the cursor, in `seq` order.
+/// `total` is the user's number of live records, for progress. `more` is true when the page
+/// stopped at the size limit; the page after it can be empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullResponse {
+    pub records: Vec<Record>,
+    pub next_cursor: i64,
+    pub total: i64,
+    pub more: bool,
+}
+
 /// Body of `POST /v1/devices`: a GitHub token that proves the account, and a name for the device.
 /// `replace_device_id` names one of the account's devices to remove in the same step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +348,14 @@ mod tests {
         ] {
             assert_eq!(Hlc::parse(bad), Err(InvalidHlc(bad.to_owned())), "{bad}");
         }
+    }
+
+    #[test]
+    fn display_shows_the_last_stamp_with_this_writer() {
+        let mut hlc = Hlc::new("dev_a1b2");
+        assert_eq!(hlc.to_string(), "0000000000000-00000-dev_a1b2");
+        hlc.observe("1761750000999-00004-dev_x9").unwrap();
+        assert_eq!(hlc.to_string(), "1761750000999-00004-dev_a1b2");
     }
 
     #[test]
@@ -484,6 +514,21 @@ mod tests {
             serde_json::from_value::<PushResponse>(json).unwrap(),
             response
         );
+    }
+
+    #[test]
+    fn pull_reply_uses_the_wire_field_names() {
+        let json = serde_json::json!({
+            "records": [{"memory_id": "01JBQ8Z6K4M2T9X0R5N7C3V1HD", "seq": 7, "hlc": "1761750000123-00002-dev_a", "writer": "dev_a", "deleted": true}],
+            "next_cursor": 7,
+            "total": 3,
+            "more": true,
+        });
+        let response: PullResponse = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(response.records[0].seq, Some(7));
+        assert_eq!((response.next_cursor, response.total), (7, 3));
+        assert!(response.more);
+        assert_eq!(serde_json::to_value(&response).unwrap(), json);
     }
 
     #[test]

@@ -18,7 +18,9 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::routing::{get, post};
 use http_body_util::BodyExt;
+use loremaster_core::{DeviceCredential, PushResponse};
 use loremaster_service::{AppState, Config, model_client, router};
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
 pub const ALICE: &str = "gho_alice";
@@ -41,6 +43,8 @@ pub const OVERLOADED: &str = "[overloaded]";
 pub const FAIL: &str = "[fail]";
 pub const GARBAGE: &str = "[garbage]";
 pub const SLOW_MODEL: &str = "[slow]";
+/// The cap the service has when `MEMORY_CAP` is not set.
+pub const DEFAULT_CAP: i64 = 50_000;
 
 pub struct Service {
     pub router: Router,
@@ -48,20 +52,46 @@ pub struct Service {
     pub users_table: String,
     pub devices_table: String,
     pub memories_table: String,
+    pub github_api_url: String,
+    pub anthropic_api_url: String,
     pub model: Arc<FakeModel>,
 }
 
 impl Service {
     pub async fn start() -> Self {
-        Self::start_with_tables(true).await
+        Self::start_with(true, DEFAULT_CAP).await
+    }
+
+    /// A service that keeps at most `cap` live memories for each user.
+    pub async fn start_with_cap(cap: i64) -> Self {
+        Self::start_with(true, cap).await
     }
 
     /// A service whose tables were never created, so every write fails.
     pub async fn without_tables() -> Self {
-        Self::start_with_tables(false).await
+        Self::start_with(false, DEFAULT_CAP).await
     }
 
-    async fn start_with_tables(create: bool) -> Self {
+    /// The same tables served with another cap.
+    pub fn set_cap(&mut self, cap: i64) {
+        // A short model timeout, so the slow fake shows at once.
+        let model = model_client(MODEL_KEY, Duration::from_secs(1));
+        self.router = router(AppState::new(self.dynamo.clone(), model, self.config(cap)));
+    }
+
+    fn config(&self, memory_cap: i64) -> Config {
+        Config {
+            users_table: self.users_table.clone(),
+            devices_table: self.devices_table.clone(),
+            memories_table: self.memories_table.clone(),
+            github_api_url: self.github_api_url.clone(),
+            anthropic_api_url: self.anthropic_api_url.clone(),
+            model_id: MODEL_ID.to_owned(),
+            memory_cap,
+        }
+    }
+
+    async fn start_with(create: bool, cap: i64) -> Self {
         let endpoint = std::env::var("DYNAMODB_ENDPOINT")
             .unwrap_or_else(|_| "http://localhost:8000".to_owned());
         let dynamo = local_dynamo(&endpoint).await;
@@ -73,24 +103,18 @@ impl Service {
             create_tables(&dynamo, &users_table, &devices_table, &memories_table).await;
         }
         let model = Arc::new(FakeModel::default());
-        let config = Config {
-            users_table: users_table.clone(),
-            devices_table: devices_table.clone(),
-            memories_table: memories_table.clone(),
-            github_api_url: fake_github().await,
-            anthropic_api_url: fake_model(model.clone()).await,
-            model_id: MODEL_ID.to_owned(),
-        };
-        // A short timeout, so the slow fake shows at once.
-        let model_client = model_client(MODEL_KEY, Duration::from_secs(1));
-        Self {
-            router: router(AppState::new(dynamo.clone(), model_client, config)),
+        let mut service = Self {
+            router: Router::new(),
             dynamo,
             users_table,
             devices_table,
             memories_table,
+            github_api_url: fake_github().await,
+            anthropic_api_url: fake_model(model.clone()).await,
             model,
-        }
+        };
+        service.set_cap(cap);
+        service
     }
 
     pub async fn post(&self, path: &str, body: impl Into<Body>) -> (StatusCode, serde_json::Value) {
@@ -236,12 +260,30 @@ async fn create_tables(dynamo: &Client, users: &str, devices: &str, memories: &s
         )
         .build()
         .unwrap();
+    let by_evict_key = GlobalSecondaryIndex::builder()
+        .index_name("by_evict_key")
+        .key_schema(hash_key("user_id"))
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("evict_key")
+                .key_type(KeyType::Range)
+                .build()
+                .unwrap(),
+        )
+        .projection(
+            Projection::builder()
+                .projection_type(ProjectionType::KeysOnly)
+                .build(),
+        )
+        .build()
+        .unwrap();
     dynamo
         .create_table()
         .table_name(memories)
         .billing_mode(BillingMode::PayPerRequest)
         .attribute_definitions(string("user_id"))
         .attribute_definitions(string("memory_id"))
+        .attribute_definitions(string("evict_key"))
         .attribute_definitions(
             AttributeDefinition::builder()
                 .attribute_name("seq")
@@ -257,6 +299,7 @@ async fn create_tables(dynamo: &Client, users: &str, devices: &str, memories: &s
                 .build()
                 .unwrap(),
         )
+        .global_secondary_indexes(by_evict_key)
         .local_secondary_indexes(by_seq)
         .send()
         .await
@@ -298,6 +341,36 @@ async fn fake_github() -> String {
             .unwrap();
     });
     url
+}
+
+pub async fn get_item(service: &Service, table: &str, key: &[(&str, &str)]) -> Option<Item> {
+    let mut request = service
+        .dynamo
+        .get_item()
+        .table_name(table)
+        .consistent_read(true);
+    for (name, value) in key {
+        request = request.key(*name, AttributeValue::S((*value).to_owned()));
+    }
+    request.send().await.unwrap().item
+}
+
+pub async fn memory(service: &Service, user_id: &str, memory_id: &str) -> Option<Item> {
+    get_item(
+        service,
+        &service.memories_table,
+        &[("user_id", user_id), ("memory_id", memory_id)],
+    )
+    .await
+}
+
+/// The user's `next_seq` and `live_count`.
+pub async fn counters(service: &Service, user_id: &str) -> (i64, i64) {
+    let user = get_item(service, &service.users_table, &[("user_id", user_id)])
+        .await
+        .unwrap();
+    let n = |name: &str| user[name].as_n().unwrap().parse().unwrap();
+    (n("next_seq"), n("live_count"))
 }
 
 pub fn string(item: &Item, name: &str) -> String {
@@ -397,4 +470,50 @@ async fn fake_model(seen: Arc<FakeModel>) -> String {
         .with_state(seen);
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     url
+}
+
+pub const PUSH: &str = "/v1/sync/push";
+
+pub fn alice() -> String {
+    format!("gh:{ALICE_ID}")
+}
+
+pub async fn device(service: &Service, github_token: &str) -> DeviceCredential {
+    let (status, body) = service.register(github_token, "laptop").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    serde_json::from_value(body).unwrap()
+}
+
+pub fn hlc(wall_ms: u64, writer: &str) -> String {
+    format!("{wall_ms:013}-00000-{writer}")
+}
+
+pub fn fact(memory_id: &str, wall_ms: u64, writer: &str, text: &str) -> Value {
+    json!({
+        "memory_id": memory_id,
+        "hlc": hlc(wall_ms, writer),
+        "writer": writer,
+        "type": "fact",
+        "kind": "preference",
+        "scope": "user",
+        "text": text,
+        "created_at": 1_761_750_000_000_u64,
+    })
+}
+
+pub fn tombstone(memory_id: &str, wall_ms: u64, writer: &str) -> Value {
+    json!({"memory_id": memory_id, "hlc": hlc(wall_ms, writer), "writer": writer, "deleted": true})
+}
+
+pub async fn push(service: &Service, token: &str, records: &[Value]) -> (StatusCode, Value) {
+    let body = json!({ "records": records });
+    service.post_as(PUSH, token, body.to_string()).await
+}
+
+pub async fn push_ok(service: &Service, token: &str, records: &[Value]) -> Vec<String> {
+    let (status, body) = push(service, token, records).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    serde_json::from_value::<PushResponse>(body)
+        .unwrap()
+        .applied
 }

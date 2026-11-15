@@ -193,3 +193,28 @@ fn text_over_the_model_input_is_truncated() {
     assert_eq!(vectors.len(), 1);
     assert_eq!(vectors[0].len(), 384);
 }
+
+#[test]
+fn a_caller_waiting_for_the_model_gets_it_between_another_caller_s_texts() {
+    let embedder = std::sync::Arc::new(embedder());
+    let text = "Deploys go through ArgoCD, not manual kubectl. ".repeat(20);
+    let started = std::sync::Barrier::new(2);
+    let (waiter_done, loop_done) = thread::scope(|scope| {
+        let looping = scope.spawn(|| {
+            started.wait();
+            for _ in 0..100 {
+                embedder.embed(&[&text]).unwrap();
+            }
+            std::time::Instant::now()
+        });
+        started.wait();
+        thread::sleep(std::time::Duration::from_millis(20));
+        embedder.embed(&["how do we deploy?"]).unwrap();
+        let waiter_done = std::time::Instant::now();
+        (waiter_done, looping.join().unwrap())
+    });
+    assert!(
+        waiter_done < loop_done,
+        "the waiting caller got the model only after the whole loop"
+    );
+}

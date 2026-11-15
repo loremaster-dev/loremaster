@@ -23,6 +23,7 @@ use crate::recall::{Recall, RecallError, Recalled};
 use crate::redact::Redactor;
 use crate::spool::{self, SpoolEntry};
 use crate::store::{QueuedTurn, Store, StoreError};
+use crate::sync::{Cadence, SyncClient, Triggers};
 use crate::{Verb, now_ms};
 
 /// Why the daemon could not start. Shown to whoever started it.
@@ -256,6 +257,7 @@ struct Daemon {
     projects: Arc<ProjectIds>,
     /// `None` tells the worker to finish what is queued and stop.
     jobs: mpsc::Sender<Option<CaptureJob>>,
+    sync: Triggers,
 }
 
 impl Daemon {
@@ -284,6 +286,7 @@ impl Daemon {
                     source,
                 },
             ) => {
+                self.sync.pull();
                 let project_id = self.projects.get(&cwd);
                 let path = transcript_path.as_deref().map(|p| p.to_string_lossy());
                 {
@@ -485,10 +488,12 @@ async fn run_async(paths: &Paths) -> Result<(), DaemonError> {
     });
     let load_gate = Arc::new(Mutex::new(()));
     load_model_in_background(recall.clone(), paths.models(), load_gate.clone());
+    let sync = SyncClient::new(recall.clone(), paths.clone()).spawn(Cadence::DAEMON);
     let daemon = Arc::new(Daemon {
         recall,
         projects,
         jobs,
+        sync: sync.triggers(),
     });
 
     let mut terminate = signal(SignalKind::terminate())?;
@@ -526,6 +531,8 @@ async fn run_async(paths: &Paths) -> Result<(), DaemonError> {
     worker
         .join()
         .map_err(|_| io::Error::other("capture worker panicked"))?;
+    sync.stop()
+        .map_err(|_| io::Error::other("sync thread panicked"))?;
     match fs::remove_file(paths.sock()) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
         _ => Ok(()),

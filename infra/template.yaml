@@ -14,8 +14,10 @@ Resources:
       Handler: bootstrap
       Runtime: provided.al2023
       Architectures: [arm64]
-      # Model calls take up to 25 s; the HTTP API stops waiting at 30 s.
-      Timeout: 30
+      # A fixed name, so the function can invoke itself without a circular reference.
+      FunctionName: !Sub "${AWS::StackName}-service"
+      # Long enough to purge the largest account. API Gateway still ends a request at 30 s.
+      Timeout: 300
       Environment:
         Variables:
           USERS_TABLE: !Ref UsersTable
@@ -27,17 +29,35 @@ Resources:
       Policies:
         - Statement:
             - Effect: Allow
-              Action: [dynamodb:UpdateItem, dynamodb:GetItem]
+              Action:
+                - dynamodb:UpdateItem
+                - dynamodb:GetItem
+                - dynamodb:DeleteItem
+                - dynamodb:ConditionCheckItem
               Resource: !GetAtt UsersTable.Arn
             - Effect: Allow
-              Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:DeleteItem]
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:DeleteItem
+                - dynamodb:BatchWriteItem
               Resource: !GetAtt DevicesTable.Arn
             - Effect: Allow
               Action: dynamodb:Query
               Resource: !Sub "${DevicesTable.Arn}/index/by_user"
             - Effect: Allow
-              Action: [dynamodb:BatchGetItem, dynamodb:PutItem]
+              Action:
+                - dynamodb:BatchGetItem
+                - dynamodb:PutItem
+                - dynamodb:Query
+                - dynamodb:BatchWriteItem
               Resource: !GetAtt MemoriesTable.Arn
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource: !Sub "${MemoriesTable.Arn}/index/*"
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-service"
             # Secrets Manager adds a random 6-character suffix to the secret ARN.
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
@@ -94,11 +114,23 @@ Resources:
           AttributeType: S
         - AttributeName: seq
           AttributeType: N
+        - AttributeName: evict_key
+          AttributeType: S
       KeySchema:
         - AttributeName: user_id
           KeyType: HASH
         - AttributeName: memory_id
           KeyType: RANGE
+      # Live memories only, oldest first in eviction order: tombstones have no evict_key.
+      GlobalSecondaryIndexes:
+        - IndexName: by_evict_key
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: evict_key
+              KeyType: RANGE
+          Projection:
+            ProjectionType: KEYS_ONLY
       LocalSecondaryIndexes:
         - IndexName: by_seq
           KeySchema:

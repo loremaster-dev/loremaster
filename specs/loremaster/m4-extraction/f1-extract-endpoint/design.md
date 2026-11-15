@@ -51,7 +51,7 @@ Source: project `design.md` (Section 3 Extraction, Section 5 Service, Section 6 
 - 7. 200 with the kept candidates.
 
 ## Infrastructure
-- Lambda `Timeout: 10` → `30`. The API Gateway HTTP API integration limit is 30 s.
+- Lambda `Timeout` is 300 s, set for the account purge. The API Gateway HTTP API still ends a request at 30 s, so the model call stops at 25 s.
 - IAM: `secretsmanager:GetSecretValue` on `arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AWS::StackName}/anthropic-api-key-??????` (Secrets Manager adds a 6-character suffix). No Bedrock permissions.
 - IAM adds `dynamodb:GetItem` and `dynamodb:UpdateItem` on `users`. Both are granted already, so there is no change.
 - HTTP client: `reqwest` (already a dependency, rustls), 25 s request timeout, no retries. The device retries.

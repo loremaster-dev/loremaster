@@ -60,15 +60,19 @@ create devices \
   --global-secondary-indexes 'IndexName=by_user,KeySchema=[{AttributeName=user_id,KeyType=HASH}],Projection={ProjectionType=ALL}'
 
 create memories \
-  --attribute-definitions AttributeName=user_id,AttributeType=S AttributeName=memory_id,AttributeType=S AttributeName=seq,AttributeType=N \
+  --attribute-definitions AttributeName=user_id,AttributeType=S AttributeName=memory_id,AttributeType=S AttributeName=seq,AttributeType=N AttributeName=evict_key,AttributeType=S \
   --key-schema AttributeName=user_id,KeyType=HASH AttributeName=memory_id,KeyType=RANGE \
+  --global-secondary-indexes 'IndexName=by_evict_key,KeySchema=[{AttributeName=user_id,KeyType=HASH},{AttributeName=evict_key,KeyType=RANGE}],Projection={ProjectionType=KEYS_ONLY}' \
   --local-secondary-indexes 'IndexName=by_seq,KeySchema=[{AttributeName=user_id,KeyType=HASH},{AttributeName=seq,KeyType=RANGE}],Projection={ProjectionType=ALL}'
 
 echo "DynamoDB Local on $endpoint with tables users, devices and memories"
 
-# Run the service against it, from crates/loremaster-service:
-#   cargo lambda watch --env-var USERS_TABLE=users,DEVICES_TABLE=devices,MEMORIES_TABLE=memories,\
+# Run the service against it, from crates/loremaster-service. A second instance runs the account
+# purge that `DELETE /v1/account` sends to the function itself:
+#   cargo lambda watch --concurrency 2 \
+#   --env-var USERS_TABLE=users,DEVICES_TABLE=devices,MEMORIES_TABLE=memories,\
 #   GITHUB_API_URL=https://api.github.com,DYNAMODB_ENDPOINT=http://localhost:8000,\
+#   LAMBDA_ENDPOINT=http://localhost:9000,\
 #   AWS_ACCESS_KEY_ID=local,AWS_SECRET_ACCESS_KEY=local,AWS_REGION=us-east-2
 # Also set ANTHROPIC_API_KEY to a key, or the service does not start. /v1/extract calls the
 # real Messages API with it; MODEL_ID picks the model.
