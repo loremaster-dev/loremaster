@@ -52,7 +52,7 @@ fn seeded_memory_is_complete_and_recalled() {
     assert_eq!(model, MODEL_ID);
 
     let recall = Recall::new(sandbox.store()).unwrap();
-    recall.set_embedder(embedder()).unwrap();
+    recall.set_embedder(embedder(), None).unwrap();
     let output = recall
         .for_prompt_delivered("s", "p", "which package manager should I use?", now_ms())
         .unwrap()

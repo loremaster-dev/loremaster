@@ -16,7 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 
-use crate::config::{Paths, create_private_dir};
+use crate::config::{self, Paths, create_private_dir};
 use crate::embed::{self, EmbedError, Embedder};
 use crate::project::ProjectIds;
 use crate::recall::{Recall, RecallError, Recalled};
@@ -390,8 +390,14 @@ async fn serve_connection(daemon: Arc<Daemon>, stream: UnixStream) -> io::Result
 }
 
 /// Loads the model in the background, so hooks are served while it downloads or loads. Until it is
-/// ready, prompts get no recall; profile and capture work.
-fn load_model_in_background(recall: Arc<Recall>, models: PathBuf, load_gate: Arc<Mutex<()>>) {
+/// ready, prompts get no recall; profile and capture work. The device logged in at that time
+/// removes duplicates among the memories that it embeds then.
+fn load_model_in_background(
+    recall: Arc<Recall>,
+    models: PathBuf,
+    credentials: PathBuf,
+    load_gate: Arc<Mutex<()>>,
+) {
     thread::spawn(move || {
         let dir = embed::model_dir(&models);
         let loaded = embed::ensure_model(&dir, &embed::base_url(), &embed::MODEL_FILES)
@@ -400,7 +406,12 @@ fn load_model_in_background(recall: Arc<Recall>, models: PathBuf, load_gate: Arc
                 Embedder::load(&dir)
             })
             .map_err(|e: EmbedError| e.to_string())
-            .and_then(|embedder| recall.set_embedder(embedder).map_err(|e| e.to_string()));
+            .and_then(|embedder| {
+                let device = config::load_credential(&credentials).map(|c| c.device_id);
+                recall
+                    .set_embedder(embedder, device.as_deref())
+                    .map_err(|e| e.to_string())
+            });
         match loaded {
             Ok(()) => tracing::info!("embedder ready"),
             Err(e) => tracing::error!(error = %e, "embedding model not available"),
@@ -487,7 +498,12 @@ async fn run_async(paths: &Paths) -> Result<(), DaemonError> {
         }
     });
     let load_gate = Arc::new(Mutex::new(()));
-    load_model_in_background(recall.clone(), paths.models(), load_gate.clone());
+    load_model_in_background(
+        recall.clone(),
+        paths.models(),
+        paths.credentials(),
+        load_gate.clone(),
+    );
     let sync = SyncClient::new(recall.clone(), paths.clone()).spawn(Cadence::DAEMON);
     let daemon = Arc::new(Daemon {
         recall,

@@ -1,6 +1,7 @@
 //! Chooses what to inject: a profile at session start, relevant memories on each prompt.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 
@@ -152,8 +153,13 @@ impl Recall {
     }
 
     /// Makes the embedding model available once it has loaded, then brings memories embedded with
-    /// another model up to date.
-    pub fn set_embedder(&self, embedder: Embedder) -> Result<(), RecallError> {
+    /// another model up to date. `writer` is the logged-in device, which removes duplicates among
+    /// them.
+    pub fn set_embedder(
+        &self,
+        embedder: Embedder,
+        writer: Option<&str>,
+    ) -> Result<(), RecallError> {
         let embedder = self.embedder.get_or_init(|| embedder);
         let mut stale = Vec::new();
         self.store().for_each_memory(|memory| {
@@ -161,7 +167,7 @@ impl Recall {
                 stale.push(memory);
             }
         })?;
-        self.add_vectors(embedder, stale)
+        self.add_vectors(embedder, stale, writer)
     }
 
     /// Stores the memories of a pulled page that are newer than the local copies, saves the
@@ -218,23 +224,31 @@ impl Recall {
                 }
             }
         }
+        let embedded: Vec<&str> = stored
+            .iter()
+            .filter(|memory| memory.vector.is_some())
+            .map(|memory| memory.record.memory_id.as_str())
+            .collect();
+        self.remove_duplicates(&embedded, writer)?;
         let count = stored.len();
         // The model finished loading during this page, after its backfill read the store.
         if embedder.is_none()
             && let Some(embedder) = self.embedder.get()
         {
-            self.add_vectors(embedder, stored)?;
+            self.add_vectors(embedder, stored, Some(writer))?;
         }
         Ok(count)
     }
 
     /// Embeds memories that have text and adds them to the index. A memory changed since it was
-    /// read keeps its new version.
+    /// read keeps its new version. With a `writer`, then removes duplicates among them.
     fn add_vectors(
         &self,
         embedder: &Embedder,
         memories: Vec<StoredMemory>,
+        writer: Option<&str>,
     ) -> Result<(), RecallError> {
+        let mut embedded = Vec::new();
         for mut memory in memories {
             let Some(text) = embeddable_text(&memory.record) else {
                 continue;
@@ -253,7 +267,49 @@ impl Recall {
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(&memory)?;
+                embedded.push(memory.record.memory_id);
             }
+        }
+        match writer {
+            Some(writer) => {
+                let ids: Vec<&str> = embedded.iter().map(String::as_str).collect();
+                self.remove_duplicates(&ids, writer)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Tombstones one fact of each pair of near-identical live facts that includes one of
+    /// `memory_ids`. Every device keeps the smaller id, so devices that both have the pair end
+    /// with the same fact.
+    fn remove_duplicates(&self, memory_ids: &[&str], writer: &str) -> Result<(), RecallError> {
+        if memory_ids.is_empty() {
+            return Ok(());
+        }
+        // Another process, such as a seeding tool, can have added local facts.
+        self.refresh_index()?;
+        // One lock for each scan: a full backfill scans once for each memory, and a pull or a
+        // prompt must get the index between scans.
+        let losers: BTreeSet<String> = memory_ids
+            .iter()
+            .flat_map(|&id| {
+                let index = self.index.read().unwrap_or_else(|e| e.into_inner());
+                index
+                    .near_duplicates(id)
+                    .into_iter()
+                    .map(|other| id.max(other).to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if losers.is_empty() {
+            return Ok(());
+        }
+        let mut tombstones: Vec<StoredMemory> = losers.iter().map(|id| tombstone(id)).collect();
+        self.store()
+            .write_local(&mut tombstones, writer, crate::now_ms())?;
+        let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
+        for id in &losers {
+            index.mark_not_live(id);
         }
         Ok(())
     }
@@ -389,6 +445,30 @@ impl Recall {
             *self.index.write().unwrap_or_else(|e| e.into_inner()) = index;
         }
         Ok(())
+    }
+}
+
+/// A local delete of `memory_id`. `write_local` gives it this device's stamp.
+fn tombstone(memory_id: &str) -> StoredMemory {
+    StoredMemory {
+        record: Record {
+            user_id: None,
+            memory_id: memory_id.to_owned(),
+            seq: None,
+            hlc: String::new(),
+            writer: String::new(),
+            record_type: None,
+            kind: None,
+            scope: None,
+            project_id: None,
+            text: None,
+            created_at: None,
+            superseded_by: None,
+            deleted: true,
+            evict_key: None,
+        },
+        vector: None,
+        model_id: None,
     }
 }
 

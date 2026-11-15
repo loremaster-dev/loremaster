@@ -136,7 +136,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
       - B offline, tombstone seeded on A, B reconnects → recall probe on B no longer returns it.
       - B offline, older `hlc` change on B after a newer tombstone on A, B reconnects → tombstone wins on both.
       - Pulled record with `superseded_by` → recall probe does not return it.
-  - F5. Post-pull dedup: near-identical facts from two devices become one. Docs: tasks. Needs: F4. Status: not started.
+  - F5. Post-pull dedup: near-identical facts from two devices become one. Docs: design, tasks. Needs: F4. Status: done.
     - Verify (Two homes):
       - A and B seed the same text, same scope, both sync → larger ULID tombstoned on both. Same live row on both.
       - Same text, different scope → both stay live.
@@ -152,7 +152,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
       - Cap 5 (`MEMORY_CAP`): no replaced facts left → oldest episode evicted. No episodes left → oldest other fact evicted.
       - Cap 5: 4 live + 1 new → nothing evicted (FR32).
       - Device pulls an eviction → recall probe no longer returns it. No user-visible message.
-- Status: not started.
+- Status: done.
 
 ## M4. Extraction
 - Delivers: facts and episodes extracted automatically and recalled in later sessions, on any device.
