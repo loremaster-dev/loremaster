@@ -14,12 +14,16 @@ Resources:
       Handler: bootstrap
       Runtime: provided.al2023
       Architectures: [arm64]
-      Timeout: 10
+      # Model calls take up to 25 s; the HTTP API stops waiting at 30 s.
+      Timeout: 30
       Environment:
         Variables:
           USERS_TABLE: !Ref UsersTable
           DEVICES_TABLE: !Ref DevicesTable
           MEMORIES_TABLE: !Ref MemoriesTable
+          MODEL_ID: claude-haiku-5-5
+          # Created by hand, so the key is never in the template or in git.
+          ANTHROPIC_KEY_SECRET: !Sub "${AWS::StackName}/anthropic-api-key"
       Policies:
         - Statement:
             - Effect: Allow
@@ -34,6 +38,10 @@ Resources:
             - Effect: Allow
               Action: [dynamodb:BatchGetItem, dynamodb:PutItem]
               Resource: !GetAtt MemoriesTable.Arn
+            # Secrets Manager adds a random 6-character suffix to the secret ARN.
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AWS::StackName}/anthropic-api-key-??????"
       Events:
         Api:
           Type: HttpApi
