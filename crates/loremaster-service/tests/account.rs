@@ -2,6 +2,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use axum::Router;
@@ -9,7 +10,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use common::{ALICE, ALICE_ID, BOB, BOB_ID, Service, string};
-use loremaster_service::{AppState, Config, purge_account, router};
+use loremaster_service::{AppState, Config, model_client, purge_account, router};
 
 fn alice() -> String {
     format!("gh:{ALICE_ID}")
@@ -26,9 +27,12 @@ fn state(service: &Service) -> AppState {
         devices_table: service.devices_table.clone(),
         memories_table: service.memories_table.clone(),
         github_api_url: "http://127.0.0.1:9".to_owned(),
+        anthropic_api_url: "http://127.0.0.1:9".to_owned(),
+        model_id: common::MODEL_ID.to_owned(),
         memory_cap: common::DEFAULT_CAP,
     };
-    AppState::new(service.dynamo.clone(), config)
+    let model = model_client(common::MODEL_KEY, Duration::from_secs(1));
+    AppState::new(service.dynamo.clone(), model, config)
 }
 
 async fn register(service: &Service, github_token: &str, name: &str) -> String {

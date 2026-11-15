@@ -241,7 +241,7 @@ API Gateway HTTP API + one Rust Lambda running the whole `axum` router (via `lam
 | `DELETE /v1/account` | | 202 | |
 
 - All except `POST /v1/devices` require a device token, checked by `axum` auth middleware: SHA-256 the bearer token, look up `devices`, attach `user_id`. Lookup on every request, so deletion is immediate.
-- LLM endpoints: prompts are server-side; devices send data only. Per-user daily input-token counter on the user item; over 5M tokens/day returns 429, device retries next day. API Gateway account throttle as backstop.
+- LLM endpoints: prompts are server-side; devices send data only. Haiku via the Anthropic Messages API with one service API key in AWS Secrets Manager, read at cold start; the key never reaches a device or a user. Per-user daily input-token counter on the user item; over 5M tokens/day returns 429, device retries next day. API Gateway account throttle as backstop.
 
 ### 50k cap (FR33)
 - Push updates `users.live_count` (Section 4). Over 50k: push handler queries the eviction GSI oldest-first (replaced facts, then episodes, then other facts) and writes tombstones with `writer = server`, decrementing `live_count` the same way. Devices get them on next pull. No user notification.

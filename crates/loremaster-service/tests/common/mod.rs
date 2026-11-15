@@ -1,8 +1,10 @@
-//! A service wired to DynamoDB Local and a fake GitHub, one set of tables per test.
+//! A service wired to DynamoDB Local, a fake GitHub and a fake Messages API, one set of tables
+//! per test.
 // Each test binary uses only some of these helpers.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aws_sdk_dynamodb::Client;
@@ -12,11 +14,12 @@ use aws_sdk_dynamodb::types::{
 };
 use axum::Router;
 use axum::body::Body;
+use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode, header};
-use axum::routing::get;
+use axum::routing::{get, post};
 use http_body_util::BodyExt;
 use loremaster_core::{DeviceCredential, PushResponse};
-use loremaster_service::{AppState, Config, router};
+use loremaster_service::{AppState, Config, model_client, router};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -29,6 +32,17 @@ pub const SLOW: &str = "gho_slow";
 
 pub type Item = HashMap<String, AttributeValue>;
 
+/// Input tokens that the fake Messages API reports for every call.
+pub const FAKE_INPUT_TOKENS: u64 = 1_200;
+/// A turn with this prefix makes the fake record the JSON after it as the tool input.
+pub const REPLY: &str = "reply:";
+/// Turns with these markers make the fake fail in one way.
+pub const NO_TOOL: &str = "[no-tool]";
+pub const RATE_LIMITED: &str = "[rate-limited]";
+pub const OVERLOADED: &str = "[overloaded]";
+pub const FAIL: &str = "[fail]";
+pub const GARBAGE: &str = "[garbage]";
+pub const SLOW_MODEL: &str = "[slow]";
 /// The cap the service has when `MEMORY_CAP` is not set.
 pub const DEFAULT_CAP: i64 = 50_000;
 
@@ -39,6 +53,8 @@ pub struct Service {
     pub devices_table: String,
     pub memories_table: String,
     pub github_api_url: String,
+    pub anthropic_api_url: String,
+    pub model: Arc<FakeModel>,
 }
 
 impl Service {
@@ -58,7 +74,9 @@ impl Service {
 
     /// The same tables served with another cap.
     pub fn set_cap(&mut self, cap: i64) {
-        self.router = router(AppState::new(self.dynamo.clone(), self.config(cap)));
+        // A short model timeout, so the slow fake shows at once.
+        let model = model_client(MODEL_KEY, Duration::from_secs(1));
+        self.router = router(AppState::new(self.dynamo.clone(), model, self.config(cap)));
     }
 
     fn config(&self, memory_cap: i64) -> Config {
@@ -67,6 +85,8 @@ impl Service {
             devices_table: self.devices_table.clone(),
             memories_table: self.memories_table.clone(),
             github_api_url: self.github_api_url.clone(),
+            anthropic_api_url: self.anthropic_api_url.clone(),
+            model_id: MODEL_ID.to_owned(),
             memory_cap,
         }
     }
@@ -82,6 +102,7 @@ impl Service {
         if create {
             create_tables(&dynamo, &users_table, &devices_table, &memories_table).await;
         }
+        let model = Arc::new(FakeModel::default());
         let mut service = Self {
             router: Router::new(),
             dynamo,
@@ -89,6 +110,8 @@ impl Service {
             devices_table,
             memories_table,
             github_api_url: fake_github().await,
+            anthropic_api_url: fake_model(model.clone()).await,
+            model,
         };
         service.set_cap(cap);
         service
@@ -352,6 +375,101 @@ pub async fn counters(service: &Service, user_id: &str) -> (i64, i64) {
 
 pub fn string(item: &Item, name: &str) -> String {
     item[name].as_s().unwrap().clone()
+}
+
+pub const MODEL_ID: &str = "test-model";
+/// The API key that the service under test sends, and the only one the fake accepts.
+pub const MODEL_KEY: &str = "sk-ant-test";
+
+/// What the fake Messages API saw: the number of calls and the last request.
+#[derive(Default)]
+pub struct FakeModel {
+    requests: Mutex<Vec<(HeaderMap, serde_json::Value)>>,
+}
+
+impl FakeModel {
+    pub fn calls(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+
+    /// The headers and JSON body of the last Messages request.
+    pub fn last_request(&self) -> (HeaderMap, serde_json::Value) {
+        self.requests.lock().unwrap().last().cloned().unwrap()
+    }
+}
+
+/// Serves `POST /v1/messages`. The turn picks the reply: a prefix or a marker from above, or
+/// else one preference fact.
+async fn fake_model(seen: Arc<FakeModel>) -> String {
+    async fn messages(
+        State(seen): State<Arc<FakeModel>>,
+        headers: HeaderMap,
+        axum::Json(request): axum::Json<serde_json::Value>,
+    ) -> (StatusCode, String) {
+        let turn = request["messages"][0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let authorized = headers.get("x-api-key").is_some_and(|key| key == MODEL_KEY);
+        let model = request["model"].clone();
+        seen.requests.lock().unwrap().push((headers, request));
+        let error = |status: u16, error_type: &str| {
+            let body = serde_json::json!({
+                "type": "error",
+                "error": {"type": error_type, "message": "fake failure"},
+            });
+            (StatusCode::from_u16(status).unwrap(), body.to_string())
+        };
+        if !authorized {
+            return error(401, "authentication_error");
+        }
+        if turn.contains(RATE_LIMITED) {
+            return error(429, "rate_limit_error");
+        }
+        if turn.contains(OVERLOADED) {
+            return error(529, "overloaded_error");
+        }
+        if turn.contains(FAIL) {
+            return error(500, "api_error");
+        }
+        if turn.contains(GARBAGE) {
+            return (StatusCode::OK, "not json".to_owned());
+        }
+        if turn.contains(SLOW_MODEL) {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let tool_use = |input| serde_json::json!({"type": "tool_use", "id": "toolu_1", "name": "record_candidates", "input": input});
+        let (content, stop_reason) = if turn.contains(NO_TOOL) {
+            (serde_json::json!([]), "refusal")
+        } else {
+            let input = match turn.strip_prefix(REPLY) {
+                Some(json) => serde_json::from_str(json).unwrap(),
+                None => serde_json::json!({"candidates": [
+                    {"text": "Prefers pnpm over npm", "scope": "user", "kind": "preference"}
+                ]}),
+            };
+            // A block type the service does not know comes first, as new API features can add.
+            let content = serde_json::json!([{"type": "unknown_block"}, tool_use(input)]);
+            (content, "tool_use")
+        };
+        let body = serde_json::json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": content,
+            "stop_reason": stop_reason,
+            "usage": {"input_tokens": FAKE_INPUT_TOKENS, "output_tokens": 40},
+        });
+        (StatusCode::OK, body.to_string())
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new()
+        .route("/v1/messages", post(messages))
+        .with_state(seen);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    url
 }
 
 pub const PUSH: &str = "/v1/sync/push";

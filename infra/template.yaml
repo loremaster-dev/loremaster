@@ -23,6 +23,9 @@ Resources:
           USERS_TABLE: !Ref UsersTable
           DEVICES_TABLE: !Ref DevicesTable
           MEMORIES_TABLE: !Ref MemoriesTable
+          MODEL_ID: claude-haiku-5-5
+          # Created by hand, so the key is never in the template or in git.
+          ANTHROPIC_KEY_SECRET: !Sub "${AWS::StackName}/anthropic-api-key"
       Policies:
         - Statement:
             - Effect: Allow
@@ -55,6 +58,10 @@ Resources:
             - Effect: Allow
               Action: lambda:InvokeFunction
               Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-service"
+            # Secrets Manager adds a random 6-character suffix to the secret ARN.
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AWS::StackName}/anthropic-api-key-??????"
       Events:
         Api:
           Type: HttpApi

@@ -217,6 +217,26 @@ pub struct PushResponse {
     pub applied: Vec<String>,
 }
 
+/// Body of `POST /v1/extract`: one prepared turn, as the queue stores it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractRequest {
+    pub turn: String,
+}
+
+/// Reply to an extract: at most 3 facts worth remembering from the turn. Most turns give none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractResponse {
+    pub candidates: Vec<Candidate>,
+}
+
+/// A fact the service proposes to remember. The device decides whether to store it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Candidate {
+    pub text: String,
+    pub scope: Scope,
+    pub kind: Kind,
+}
+
 /// One page of `GET /v1/sync/pull`: records with a `seq` above the cursor, in `seq` order.
 /// `total` is the user's number of live records, for progress. `more` is true when the page
 /// stopped at the size limit; the page after it can be empty.
@@ -590,6 +610,32 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<DeviceLimitReached>(json).unwrap(),
             limit
+        );
+    }
+
+    #[test]
+    fn extract_bodies_use_the_wire_field_names() {
+        let request: ExtractRequest =
+            serde_json::from_value(serde_json::json!({"turn": "{\"prompt\":\"hi\"}"})).unwrap();
+        assert_eq!(request.turn, r#"{"prompt":"hi"}"#);
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({"turn": r#"{"prompt":"hi"}"#})
+        );
+        let response = ExtractResponse {
+            candidates: vec![Candidate {
+                text: "Prefers pnpm over npm".to_owned(),
+                scope: Scope::User,
+                kind: Kind::Preference,
+            }],
+        };
+        let json = serde_json::json!({
+            "candidates": [{"text": "Prefers pnpm over npm", "scope": "user", "kind": "preference"}]
+        });
+        assert_eq!(serde_json::to_value(&response).unwrap(), json);
+        assert_eq!(
+            serde_json::from_value::<ExtractResponse>(json).unwrap(),
+            response
         );
     }
 }

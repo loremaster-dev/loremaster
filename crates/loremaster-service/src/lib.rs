@@ -1,5 +1,9 @@
 //! The sync service: one `axum` router that runs in a Lambda behind an HTTP API.
 
+mod llm;
+
+pub use llm::model_client;
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::sync::Arc;
@@ -9,6 +13,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::DisplayErrorContext;
 use aws_sdk_dynamodb::operation::transact_get_items::TransactGetItemsError;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
+use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::{
     AttributeValue, CancellationReason, ConditionCheck, Delete, DeleteRequest, Get,
     KeysAndAttributes, Put, TransactGetItem, TransactWriteItem, Update, WriteRequest,
@@ -24,8 +29,8 @@ use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use lambda_http::request::LambdaRequest;
 use loremaster_core::{
-    Device, DeviceCredential, DeviceLimitReached, DeviceList, Hlc, PullResponse, PushRequest,
-    PushResponse, Record, RecordType, RegisterDevice, Scope,
+    Device, DeviceCredential, DeviceLimitReached, DeviceList, ExtractRequest, ExtractResponse, Hlc,
+    PullResponse, PushRequest, PushResponse, Record, RecordType, RegisterDevice, Scope,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -40,18 +45,23 @@ const MAX_PUSH_RECORDS: usize = 99;
 /// The writer of the tombstones that the cap eviction makes.
 const SERVER_WRITER: &str = "server";
 const MAX_TEXT_CHARS: usize = 2_000;
+const MAX_TURN_TOKENS: usize = 32_000;
+const DAILY_TOKEN_CAP: u64 = 5_000_000;
+const DAY_MS: u64 = 86_400_000;
 const BATCH_WRITE_ITEMS: usize = 25;
 const BATCH_GET_KEYS: usize = 100;
 const UNPROCESSED_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_UNPROCESSED_BACKOFF: Duration = Duration::from_secs(2);
 
-/// Where the service keeps its data, how many live memories a user keeps, and where it checks
-/// GitHub accounts.
+/// Where the service keeps its data, how many live memories a user keeps, where it checks
+/// GitHub accounts, and which model it asks.
 pub struct Config {
     pub users_table: String,
     pub devices_table: String,
     pub memories_table: String,
     pub github_api_url: String,
+    pub anthropic_api_url: String,
+    pub model_id: String,
     pub memory_cap: i64,
 }
 
@@ -68,7 +78,8 @@ const DEFAULT_MEMORY_CAP: i64 = 50_000;
 
 impl Config {
     /// Reads `USERS_TABLE`, `DEVICES_TABLE`, `MEMORIES_TABLE`, `GITHUB_API_URL` (default
-    /// `https://api.github.com`) and `MEMORY_CAP` (default 50,000).
+    /// `https://api.github.com`), `MEMORY_CAP` (default 50,000), `ANTHROPIC_API_URL` (default
+    /// `https://api.anthropic.com`) and `MODEL_ID` (default Claude Haiku 5.5).
     pub fn from_env() -> Result<Self, EnvError> {
         let required = |name| std::env::var(name).map_err(|_| EnvError::Missing(name));
         Ok(Self {
@@ -77,6 +88,9 @@ impl Config {
             memories_table: required("MEMORIES_TABLE")?,
             github_api_url: std::env::var("GITHUB_API_URL")
                 .unwrap_or_else(|_| "https://api.github.com".to_owned()),
+            anthropic_api_url: std::env::var("ANTHROPIC_API_URL")
+                .unwrap_or_else(|_| "https://api.anthropic.com".to_owned()),
+            model_id: std::env::var("MODEL_ID").unwrap_or_else(|_| "claude-haiku-5-5".to_owned()),
             memory_cap: memory_cap(std::env::var("MEMORY_CAP").ok().as_deref())?,
         })
     }
@@ -98,6 +112,7 @@ fn memory_cap(value: Option<&str>) -> Result<i64, EnvError> {
 #[derive(Clone)]
 pub struct AppState {
     dynamo: Client,
+    model: reqwest::Client,
     github: reqwest::Client,
     config: Arc<Config>,
     purger: Option<Purger>,
@@ -111,7 +126,8 @@ struct Purger {
 }
 
 impl AppState {
-    pub fn new(dynamo: Client, config: Config) -> Self {
+    /// `model` is the client from [`model_client`], which holds the API key.
+    pub fn new(dynamo: Client, model: reqwest::Client, config: Config) -> Self {
         let github = reqwest::Client::builder()
             .timeout(GITHUB_TIMEOUT)
             .user_agent("loremaster-service")
@@ -119,6 +135,7 @@ impl AppState {
             .expect("TLS backend initializes");
         Self {
             dynamo,
+            model,
             github,
             config: Arc::new(config),
             purger: None,
@@ -143,6 +160,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/{id}", delete(delete_device))
         .route("/v1/sync/push", post(push_records))
+        .route("/v1/extract", post(extract))
         .route("/v1/sync/pull", get(pull_records))
         .route("/v1/account", delete(delete_account))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
@@ -168,6 +186,14 @@ enum ApiError {
     DeviceLimit(Vec<Device>),
     #[error("retry")]
     Conflict,
+    #[error("turn is over {MAX_TURN_TOKENS} tokens")]
+    TurnTooLarge,
+    #[error("daily token limit reached")]
+    DailyCap,
+    #[error("model is unavailable")]
+    ModelUnavailable,
+    #[error("model is busy")]
+    ModelBusy,
     #[error("account deletion in progress")]
     DeletionInProgress,
     #[error("internal error")]
@@ -188,6 +214,10 @@ impl IntoResponse for ApiError {
                 return (StatusCode::CONFLICT, Json(body)).into_response();
             }
             Self::Conflict | Self::DeletionInProgress => StatusCode::CONFLICT,
+            Self::TurnTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::DailyCap => StatusCode::TOO_MANY_REQUESTS,
+            Self::ModelUnavailable => StatusCode::BAD_GATEWAY,
+            Self::ModelBusy => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(serde_json::json!({ "error": error }))).into_response()
@@ -272,10 +302,7 @@ fn new_device(
     credential: &DeviceCredential,
 ) -> Result<TransactWriteItem, ApiError> {
     let s = |value: &str| AttributeValue::S(value.to_owned());
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(internal)?
-        .as_millis();
+    let created_at = now_ms()?;
     let put = Put::builder()
         .table_name(&state.config.devices_table)
         .item("token_hash", s(&token_hash(&credential.token)))
@@ -1044,6 +1071,160 @@ fn memory_put(
     Ok(TransactWriteItem::builder().put(put).build())
 }
 
+fn now_ms() -> Result<u64, ApiError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(internal)?;
+    u64::try_from(elapsed.as_millis()).map_err(internal)
+}
+
+/// The UTC date of an epoch-milliseconds time, as `YYYY-MM-DD`.
+pub fn utc_day(epoch_ms: u64) -> String {
+    // Days to civil date, from Howard Hinnant's `civil_from_days`, with March as the first month
+    // so the leap day falls at the end of the year.
+    let days = (epoch_ms / DAY_MS) as i64 + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+impl From<llm::LlmError> for ApiError {
+    fn from(error: llm::LlmError) -> Self {
+        match error {
+            llm::LlmError::Throttled => Self::ModelBusy,
+            llm::LlmError::Failed => Self::ModelUnavailable,
+        }
+    }
+}
+
+/// Proposes the facts in one prepared turn that are worth remembering. Each user has a daily
+/// budget of model input tokens.
+async fn extract(
+    State(state): State<AppState>,
+    Extension(Caller { user_id, .. }): Extension<Caller>,
+    body: Result<Json<ExtractRequest>, JsonRejection>,
+) -> Result<Json<ExtractResponse>, ApiError> {
+    let Json(ExtractRequest { turn }) =
+        body.map_err(|rejection| ApiError::BadRequest(rejection.body_text()))?;
+    if turn.trim().is_empty() {
+        return Err(ApiError::BadRequest("turn is empty".to_owned()));
+    }
+    if loremaster_core::estimate_tokens(&turn) > MAX_TURN_TOKENS {
+        return Err(ApiError::TurnTooLarge);
+    }
+    if tokens_used(&state, &user_id, &utc_day(now_ms()?)).await? >= DAILY_TOKEN_CAP {
+        return Err(ApiError::DailyCap);
+    }
+    let reply = llm::extract(
+        &state.model,
+        &state.config.anthropic_api_url,
+        &state.config.model_id,
+        &turn,
+    )
+    .await?;
+    // The day is read again: a call that ends after midnight counts on the new day.
+    add_tokens(&state, &user_id, &utc_day(now_ms()?), reply.input_tokens).await?;
+    let candidates = llm::candidates(reply.tool_input)?;
+    Ok(Json(ExtractResponse { candidates }))
+}
+
+/// The model input tokens the user has used on `today`.
+async fn tokens_used(state: &AppState, user_id: &str, today: &str) -> Result<u64, ApiError> {
+    let user = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.users_table)
+        .key("user_id", AttributeValue::S(user_id.to_owned()))
+        .consistent_read(true)
+        .projection_expression("tokens_day, tokens_used")
+        .send()
+        .await
+        .map_err(|error| internal(DisplayErrorContext(error)))?
+        .item
+        .ok_or_else(|| internal("authenticated user has no user item"))?;
+    if user
+        .get("tokens_day")
+        .and_then(|day| day.as_s().ok())
+        .map(String::as_str)
+        != Some(today)
+    {
+        return Ok(0);
+    }
+    user.get("tokens_used")
+        .and_then(|value| value.as_n().ok())
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| internal("user item has no valid tokens_used"))
+}
+
+/// Adds the tokens to the user's count for `today`. The first call of a day starts a new count.
+async fn add_tokens(
+    state: &AppState,
+    user_id: &str,
+    today: &str,
+    tokens: u64,
+) -> Result<(), ApiError> {
+    // A parallel call can start the new day between the first two updates; the count is then on
+    // today, and the first update holds on its next try.
+    for same_day in [true, false, true] {
+        if update_tokens(state, user_id, today, tokens, same_day).await? {
+            return Ok(());
+        }
+    }
+    Err(internal("token count changed day during the update"))
+}
+
+/// One conditional update of the token count. False when its condition on the day failed.
+async fn update_tokens(
+    state: &AppState,
+    user_id: &str,
+    today: &str,
+    tokens: u64,
+    same_day: bool,
+) -> Result<bool, ApiError> {
+    let (update, condition) = if same_day {
+        ("SET tokens_used = tokens_used + :n", "tokens_day = :today")
+    } else {
+        (
+            "SET tokens_day = :today, tokens_used = :n",
+            "attribute_not_exists(tokens_day) OR tokens_day <> :today",
+        )
+    };
+    let result = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.users_table)
+        .key("user_id", AttributeValue::S(user_id.to_owned()))
+        .update_expression(update)
+        .condition_expression(condition)
+        .expression_attribute_values(":today", AttributeValue::S(today.to_owned()))
+        .expression_attribute_values(":n", AttributeValue::N(tokens.to_string()))
+        .send()
+        .await;
+    match result {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.as_service_error(),
+                Some(UpdateItemError::ConditionalCheckFailedException(_))
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(internal(DisplayErrorContext(error))),
+    }
+}
+
 /// One page of the user's records with a `seq` above the cursor, in `seq` order. The query is
 /// strongly consistent: an eventual read can show a `seq` before a lower one, and a reader whose
 /// cursor moves past the lower one never gets it.
@@ -1354,6 +1535,20 @@ async fn batch_delete(state: &AppState, table: &str, keys: Vec<Item>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utc_day_is_the_calendar_date() {
+        assert_eq!(utc_day(0), "1970-01-01");
+        assert_eq!(utc_day(DAY_MS - 1), "1970-01-01");
+        // 2024-02-29T12:00:00Z, a leap day.
+        assert_eq!(utc_day(1_709_208_000_000), "2024-02-29");
+        assert_eq!(utc_day(1_709_208_000_000 + DAY_MS), "2024-03-01");
+        // 2023-12-31T23:59:59.999Z, the last moment of a year.
+        assert_eq!(utc_day(1_704_067_199_999), "2023-12-31");
+        assert_eq!(utc_day(1_704_067_200_000), "2024-01-01");
+        // 2100 is not a leap year: 2100-02-28T00:00:00Z plus one day.
+        assert_eq!(utc_day(4_107_456_000_000 + DAY_MS), "2100-03-01");
+    }
 
     fn reasons(codes: &[&str]) -> Vec<CancellationReason> {
         codes

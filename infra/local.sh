@@ -74,4 +74,6 @@ echo "DynamoDB Local on $endpoint with tables users, devices and memories"
 #   GITHUB_API_URL=https://api.github.com,DYNAMODB_ENDPOINT=http://localhost:8000,\
 #   LAMBDA_ENDPOINT=http://localhost:9000,\
 #   AWS_ACCESS_KEY_ID=local,AWS_SECRET_ACCESS_KEY=local,AWS_REGION=us-east-2
+# Also set ANTHROPIC_API_KEY to a key, or the service does not start. /v1/extract calls the
+# real Messages API with it; MODEL_ID picks the model.
 # Then call http://localhost:9000/lambda-url/loremaster-service/v1/devices
