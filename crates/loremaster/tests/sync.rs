@@ -25,12 +25,12 @@ const QUICK: Cadence = Cadence {
     retry: Duration::from_millis(200),
 };
 
+/// Swaps the config with a rename, so the sync loop never reads a half-written file.
 fn set_api_url(sandbox: &Sandbox, url: &str) {
-    fs::write(
-        sandbox.paths.config_toml(),
-        format!("api_url = \"{url}\"\n"),
-    )
-    .unwrap();
+    let config = sandbox.paths.config_toml();
+    let temp = config.with_extension("toml.tmp");
+    fs::write(&temp, format!("api_url = \"{url}\"\n")).unwrap();
+    fs::rename(temp, config).unwrap();
 }
 
 fn save_credential(sandbox: &Sandbox, credential: &DeviceCredential) {
