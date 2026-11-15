@@ -2,11 +2,10 @@
 
 mod common;
 
-use aws_sdk_dynamodb::types::AttributeValue;
 use axum::http::StatusCode;
 use common::{
-    ALICE, ALICE_ID, FAIL, FAKE_INPUT_TOKENS, GARBAGE, Item, MODEL_ID, MODEL_KEY, NO_TOOL,
-    OVERLOADED, RATE_LIMITED, REPLY, SLOW_MODEL, Service,
+    ALICE, FAIL, FAKE_INPUT_TOKENS, GARBAGE, MODEL_ID, MODEL_KEY, NO_TOOL, OVERLOADED,
+    RATE_LIMITED, REPLY, SLOW_MODEL, Service, counter, set_counter, today,
 };
 use loremaster_core::{Candidate, DeviceCredential, ExtractResponse, Kind, Scope};
 use loremaster_service::utc_day;
@@ -104,54 +103,11 @@ async fn bad_bodies_are_400() {
 
 const DAY_MS: u64 = 86_400_000;
 
-fn today() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap();
-    utc_day(now.as_millis() as u64)
-}
-
 fn yesterday() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap();
     utc_day(now.as_millis() as u64 - DAY_MS)
-}
-
-async fn user(service: &Service) -> Item {
-    service
-        .dynamo
-        .get_item()
-        .table_name(&service.users_table)
-        .key("user_id", AttributeValue::S(format!("gh:{ALICE_ID}")))
-        .consistent_read(true)
-        .send()
-        .await
-        .unwrap()
-        .item
-        .unwrap()
-}
-
-/// The user's token count as (day, tokens), or `None` before the first count.
-async fn counter(service: &Service) -> Option<(String, u64)> {
-    let user = user(service).await;
-    let day = user.get("tokens_day")?.as_s().unwrap().clone();
-    let used = user["tokens_used"].as_n().unwrap().parse().unwrap();
-    Some((day, used))
-}
-
-async fn set_counter(service: &Service, day: &str, used: u64) {
-    service
-        .dynamo
-        .update_item()
-        .table_name(&service.users_table)
-        .key("user_id", AttributeValue::S(format!("gh:{ALICE_ID}")))
-        .update_expression("SET tokens_day = :day, tokens_used = :used")
-        .expression_attribute_values(":day", AttributeValue::S(day.to_owned()))
-        .expression_attribute_values(":used", AttributeValue::N(used.to_string()))
-        .send()
-        .await
-        .unwrap();
 }
 
 #[tokio::test]
