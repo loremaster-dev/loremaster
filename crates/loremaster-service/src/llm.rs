@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use loremaster_core::Candidate;
+use loremaster_core::{Candidate, Neighbour, ReconcileRequest, ReconcileResponse};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -10,10 +10,14 @@ use serde_json::{Value, json};
 use crate::MAX_TEXT_CHARS;
 
 const EXTRACT_PROMPT: &str = include_str!("../prompts/extract.md");
+const RECONCILE_PROMPT: &str = include_str!("../prompts/reconcile.md");
 const RECORD_CANDIDATES: &str = "record_candidates";
+const RECORD_DECISION: &str = "record_decision";
 const MAX_CANDIDATES: usize = 3;
 // Room for 3 facts of 2,000 characters each.
 const MAX_OUTPUT_TOKENS: u32 = 4_096;
+// Room for one fact of 2,000 characters.
+const MAX_DECISION_TOKENS: u32 = 1_024;
 const API_VERSION: &str = "2026-10-21";
 // Anthropic's status for "overloaded"; it has no `reqwest::StatusCode` constant.
 const OVERLOADED: u16 = 529;
@@ -71,6 +75,13 @@ struct Usage {
     input_tokens: u64,
 }
 
+/// A tool that Claude must call: its `input` is the structured answer.
+struct Tool {
+    name: &'static str,
+    description: &'static str,
+    input_schema: Value,
+}
+
 /// Asks Claude which facts in the prepared turn are worth remembering.
 pub(crate) async fn extract(
     client: &reqwest::Client,
@@ -78,38 +89,106 @@ pub(crate) async fn extract(
     model_id: &str,
     turn: &str,
 ) -> Result<Reply, LlmError> {
-    let request = json!({
-        "model": model_id,
-        "max_tokens": MAX_OUTPUT_TOKENS,
-        "system": EXTRACT_PROMPT,
-        "messages": [{"role": "user", "content": turn}],
-        "tools": [{
-            "name": RECORD_CANDIDATES,
-            "description": "Records the facts from the turn that are worth remembering.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "candidates": {
-                        "type": "array",
-                        "maxItems": MAX_CANDIDATES,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "text": {"type": "string", "maxLength": MAX_TEXT_CHARS},
-                                "scope": {"type": "string", "enum": ["user", "project"]},
-                                "kind": {
-                                    "type": "string",
-                                    "enum": ["preference", "decision", "correction", "environment", "pitfall"],
-                                },
+    let tool = Tool {
+        name: RECORD_CANDIDATES,
+        description: "Records the facts from the turn that are worth remembering.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "candidates": {
+                    "type": "array",
+                    "maxItems": MAX_CANDIDATES,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string", "maxLength": MAX_TEXT_CHARS},
+                            "scope": {"type": "string", "enum": ["user", "project"]},
+                            "kind": {
+                                "type": "string",
+                                "enum": ["preference", "decision", "correction", "environment", "pitfall"],
                             },
-                            "required": ["text", "scope", "kind"],
                         },
+                        "required": ["text", "scope", "kind"],
                     },
                 },
-                "required": ["candidates"],
             },
+            "required": ["candidates"],
+        }),
+    };
+    call_tool(
+        client,
+        api_url,
+        model_id,
+        EXTRACT_PROMPT,
+        &tool,
+        MAX_OUTPUT_TOKENS,
+        turn,
+    )
+    .await
+}
+
+/// Asks Claude whether the candidate is new, already stored, or replaces one of its neighbours.
+pub(crate) async fn reconcile(
+    client: &reqwest::Client,
+    api_url: &str,
+    model_id: &str,
+    request: &ReconcileRequest,
+) -> Result<Reply, LlmError> {
+    let tool = Tool {
+        name: RECORD_DECISION,
+        description: "Records what to do with the candidate fact.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "decision": {"type": "string", "enum": ["add", "supersede", "skip"]},
+                "memory_id": {
+                    "type": "string",
+                    "description": "For supersede: the neighbour that the new text replaces.",
+                },
+                "text": {
+                    "type": "string",
+                    "maxLength": MAX_TEXT_CHARS,
+                    "description": "For supersede: the fact to store in place of the neighbour.",
+                },
+            },
+            "required": ["decision"],
+        }),
+    };
+    let content = serde_json::to_string(request).expect("a request serializes");
+    call_tool(
+        client,
+        api_url,
+        model_id,
+        RECONCILE_PROMPT,
+        &tool,
+        MAX_DECISION_TOKENS,
+        &content,
+    )
+    .await
+}
+
+/// One Messages call with `system` as the prompt, `content` as the user message and `tool` as
+/// the forced tool.
+async fn call_tool(
+    client: &reqwest::Client,
+    api_url: &str,
+    model_id: &str,
+    system: &str,
+    tool: &Tool,
+    max_tokens: u32,
+    content: &str,
+) -> Result<Reply, LlmError> {
+    let request = json!({
+        "model": model_id,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{"role": "user", "content": content}],
+        "tools": [{
+            "name": tool.name,
+            "description": tool.description,
+            "input_schema": tool.input_schema,
         }],
-        "tool_choice": {"type": "tool", "name": RECORD_CANDIDATES},
+        "tool_choice": {"type": "tool", "name": tool.name},
     });
     let failed = |error: reqwest::Error| {
         tracing::error!(%error, "Messages API call failed");
@@ -133,7 +212,7 @@ pub(crate) async fn extract(
     }
     let message: Message = response.json().await.map_err(failed)?;
     let tool_input = message.content.into_iter().find_map(|block| match block {
-        Block::ToolUse { name, input } if name == RECORD_CANDIDATES => Some(input),
+        Block::ToolUse { name, input } if name == tool.name => Some(input),
         _ => None,
     });
     if tool_input.is_none() {
@@ -173,6 +252,36 @@ pub(crate) fn candidates(tool_input: Option<Value>) -> Result<Vec<Candidate>, Ll
         .collect())
 }
 
-fn valid_text(text: &str) -> bool {
+/// The decision in the tool input. A supersede must name one of the neighbours and carry a
+/// valid text; anything else is refused, so the device asks again later.
+pub(crate) fn decision(
+    tool_input: Option<Value>,
+    neighbours: &[Neighbour],
+) -> Result<ReconcileResponse, LlmError> {
+    let Some(input) = tool_input else {
+        return Err(LlmError::Failed);
+    };
+    let decision = match serde_json::from_value(input.clone()) {
+        Ok(ReconcileResponse::Supersede { memory_id, text })
+            if valid_text(&text)
+                && neighbours
+                    .iter()
+                    .any(|neighbour| neighbour.memory_id == memory_id) =>
+        {
+            ReconcileResponse::Supersede {
+                memory_id,
+                text: text.trim().to_owned(),
+            }
+        }
+        Ok(decision @ (ReconcileResponse::Add | ReconcileResponse::Skip)) => decision,
+        _ => {
+            tracing::error!(%input, "Claude recorded a bad decision");
+            return Err(LlmError::Failed);
+        }
+    };
+    Ok(decision)
+}
+
+pub(crate) fn valid_text(text: &str) -> bool {
     (1..=MAX_TEXT_CHARS).contains(&text.trim().chars().count())
 }

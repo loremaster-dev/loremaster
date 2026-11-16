@@ -169,14 +169,14 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
 - Needs: M1, M2 to start. M3 for the FR1, FR2 and FR3 cross-device exit checks.
 - Design: yes.
 - Features:
-  - F1. Extract endpoint: `POST /v1/extract` with server-held prompt, size limit and daily cap. Docs: design, tasks. Needs: M2 F3. Status: not started.
+  - F1. Extract endpoint: `POST /v1/extract` with server-held prompt, size limit and daily cap. Docs: design, tasks. Needs: M2 F3. Status: done.
     - Verify (Dev stack) [approval]:
       - Turn stating "I prefer pnpm over npm" → 1 to 3 candidates, one with `kind` preference, `scope` user.
       - Turn with only pleasantries → `candidates` empty.
       - Turn over 32k tokens → 413, no Haiku call.
       - User over 5M tokens today → 429, no Haiku call.
       - No device token → 401.
-  - F2. Reconcile endpoint: `POST /v1/reconcile` returns one decision. Docs: tasks. Needs: F1. Status: not started.
+  - F2. Reconcile endpoint: `POST /v1/reconcile` returns one decision. Docs: design, tasks. Needs: F1. Status: done.
     - Verify (Dev stack) [approval]:
       - "Uses pnpm" + neighbour "Uses npm" → SUPERSEDE, neighbour id, text <= 2,000 chars.
       - Same meaning as a neighbour → SKIP.

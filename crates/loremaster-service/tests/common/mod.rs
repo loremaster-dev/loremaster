@@ -385,9 +385,15 @@ pub const MODEL_KEY: &str = "sk-ant-test";
 #[derive(Default)]
 pub struct FakeModel {
     requests: Mutex<Vec<(HeaderMap, serde_json::Value)>>,
+    next_input: Mutex<Option<serde_json::Value>>,
 }
 
 impl FakeModel {
+    /// Makes the next successful reply record `input` as the tool input.
+    pub fn reply_next(&self, input: serde_json::Value) {
+        *self.next_input.lock().unwrap() = Some(input);
+    }
+
     pub fn calls(&self) -> usize {
         self.requests.lock().unwrap().len()
     }
@@ -398,8 +404,9 @@ impl FakeModel {
     }
 }
 
-/// Serves `POST /v1/messages`. The turn picks the reply: a prefix or a marker from above, or
-/// else one preference fact.
+/// Serves `POST /v1/messages` and calls the forced tool. The tool input is the one set with
+/// `FakeModel::reply_next`, or else a prefix or a marker from above picks it, or else it is one
+/// preference fact for extract and an add for reconcile.
 async fn fake_model(seen: Arc<FakeModel>) -> String {
     async fn messages(
         State(seen): State<Arc<FakeModel>>,
@@ -412,6 +419,10 @@ async fn fake_model(seen: Arc<FakeModel>) -> String {
             .to_owned();
         let authorized = headers.get("x-api-key").is_some_and(|key| key == MODEL_KEY);
         let model = request["model"].clone();
+        let tool = request["tool_choice"]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
         seen.requests.lock().unwrap().push((headers, request));
         let error = |status: u16, error_type: &str| {
             let body = serde_json::json!({
@@ -438,13 +449,16 @@ async fn fake_model(seen: Arc<FakeModel>) -> String {
         if turn.contains(SLOW_MODEL) {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        let tool_use = |input| serde_json::json!({"type": "tool_use", "id": "toolu_1", "name": "record_candidates", "input": input});
+        let tool_use = |input| serde_json::json!({"type": "tool_use", "id": "toolu_1", "name": tool, "input": input});
         let (content, stop_reason) = if turn.contains(NO_TOOL) {
             (serde_json::json!([]), "refusal")
         } else {
-            let input = match turn.strip_prefix(REPLY) {
-                Some(json) => serde_json::from_str(json).unwrap(),
-                None => serde_json::json!({"candidates": [
+            let queued = seen.next_input.lock().unwrap().take();
+            let input = match (queued, turn.strip_prefix(REPLY)) {
+                (Some(input), _) => input,
+                (None, Some(json)) => serde_json::from_str(json).unwrap(),
+                (None, None) if tool == "record_decision" => serde_json::json!({"decision": "add"}),
+                (None, None) => serde_json::json!({"candidates": [
                     {"text": "Prefers pnpm over npm", "scope": "user", "kind": "preference"}
                 ]}),
             };
@@ -516,4 +530,47 @@ pub async fn push_ok(service: &Service, token: &str, records: &[Value]) -> Vec<S
     serde_json::from_value::<PushResponse>(body)
         .unwrap()
         .applied
+}
+
+pub fn today() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    loremaster_service::utc_day(now.as_millis() as u64)
+}
+
+pub async fn user(service: &Service) -> Item {
+    service
+        .dynamo
+        .get_item()
+        .table_name(&service.users_table)
+        .key("user_id", AttributeValue::S(format!("gh:{ALICE_ID}")))
+        .consistent_read(true)
+        .send()
+        .await
+        .unwrap()
+        .item
+        .unwrap()
+}
+
+/// The user's token count as (day, tokens), or `None` before the first count.
+pub async fn counter(service: &Service) -> Option<(String, u64)> {
+    let user = user(service).await;
+    let day = user.get("tokens_day")?.as_s().unwrap().clone();
+    let used = user["tokens_used"].as_n().unwrap().parse().unwrap();
+    Some((day, used))
+}
+
+pub async fn set_counter(service: &Service, day: &str, used: u64) {
+    service
+        .dynamo
+        .update_item()
+        .table_name(&service.users_table)
+        .key("user_id", AttributeValue::S(format!("gh:{ALICE_ID}")))
+        .update_expression("SET tokens_day = :day, tokens_used = :used")
+        .expression_attribute_values(":day", AttributeValue::S(day.to_owned()))
+        .expression_attribute_values(":used", AttributeValue::N(used.to_string()))
+        .send()
+        .await
+        .unwrap();
 }

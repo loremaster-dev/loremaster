@@ -30,7 +30,8 @@ use axum::{Extension, Json, Router};
 use lambda_http::request::LambdaRequest;
 use loremaster_core::{
     Device, DeviceCredential, DeviceLimitReached, DeviceList, ExtractRequest, ExtractResponse, Hlc,
-    PullResponse, PushRequest, PushResponse, Record, RecordType, RegisterDevice, Scope,
+    PullResponse, PushRequest, PushResponse, ReconcileRequest, ReconcileResponse, Record,
+    RecordType, RegisterDevice, Scope,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -46,6 +47,7 @@ const MAX_PUSH_RECORDS: usize = 99;
 const SERVER_WRITER: &str = "server";
 const MAX_TEXT_CHARS: usize = 2_000;
 const MAX_TURN_TOKENS: usize = 32_000;
+const MAX_NEIGHBOURS: usize = 5;
 const DAILY_TOKEN_CAP: u64 = 5_000_000;
 const DAY_MS: u64 = 86_400_000;
 const BATCH_WRITE_ITEMS: usize = 25;
@@ -161,6 +163,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/devices/{id}", delete(delete_device))
         .route("/v1/sync/push", post(push_records))
         .route("/v1/extract", post(extract))
+        .route("/v1/reconcile", post(reconcile))
         .route("/v1/sync/pull", get(pull_records))
         .route("/v1/account", delete(delete_account))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
@@ -1137,6 +1140,56 @@ async fn extract(
     add_tokens(&state, &user_id, &utc_day(now_ms()?), reply.input_tokens).await?;
     let candidates = llm::candidates(reply.tool_input)?;
     Ok(Json(ExtractResponse { candidates }))
+}
+
+/// Decides whether a candidate fact is new, already stored, or replaces one of its neighbours.
+/// It shares the daily token budget with extract.
+async fn reconcile(
+    State(state): State<AppState>,
+    Extension(Caller { user_id, .. }): Extension<Caller>,
+    body: Result<Json<ReconcileRequest>, JsonRejection>,
+) -> Result<Json<ReconcileResponse>, ApiError> {
+    let Json(request) = body.map_err(|rejection| ApiError::BadRequest(rejection.body_text()))?;
+    check_reconcile(&request)?;
+    if tokens_used(&state, &user_id, &utc_day(now_ms()?)).await? >= DAILY_TOKEN_CAP {
+        return Err(ApiError::DailyCap);
+    }
+    let reply = llm::reconcile(
+        &state.model,
+        &state.config.anthropic_api_url,
+        &state.config.model_id,
+        &request,
+    )
+    .await?;
+    add_tokens(&state, &user_id, &utc_day(now_ms()?), reply.input_tokens).await?;
+    Ok(Json(llm::decision(reply.tool_input, &request.neighbours)?))
+}
+
+/// These limits also bound the size of the model input, so it needs no token estimate.
+fn check_reconcile(request: &ReconcileRequest) -> Result<(), ApiError> {
+    let bad = |message: String| Err(ApiError::BadRequest(message));
+    if !llm::valid_text(&request.candidate.text) {
+        return bad(format!(
+            "candidate text must be 1 to {MAX_TEXT_CHARS} characters"
+        ));
+    }
+    let neighbours = &request.neighbours;
+    if !(1..=MAX_NEIGHBOURS).contains(&neighbours.len()) {
+        return bad(format!("a reconcile has 1 to {MAX_NEIGHBOURS} neighbours"));
+    }
+    if !neighbours
+        .iter()
+        .all(|neighbour| llm::valid_text(&neighbour.text))
+    {
+        return bad(format!(
+            "neighbour text must be 1 to {MAX_TEXT_CHARS} characters"
+        ));
+    }
+    let ids: HashSet<&str> = neighbours.iter().map(|n| n.memory_id.as_str()).collect();
+    if ids.len() != neighbours.len() {
+        return bad("neighbours must have different memory_id values".to_owned());
+    }
+    Ok(())
 }
 
 /// The model input tokens the user has used on `today`.

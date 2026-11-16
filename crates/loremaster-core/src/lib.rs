@@ -237,6 +237,30 @@ pub struct Candidate {
     pub kind: Kind,
 }
 
+/// Body of `POST /v1/reconcile`: a candidate and the closest stored facts in its scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconcileRequest {
+    pub candidate: Candidate,
+    pub neighbours: Vec<Neighbour>,
+}
+
+/// A stored fact that a candidate is compared with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Neighbour {
+    pub memory_id: String,
+    pub text: String,
+}
+
+/// What the device does with a candidate. `Supersede` stores `text` as a new fact that replaces
+/// the neighbour `memory_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum ReconcileResponse {
+    Add,
+    Supersede { memory_id: String, text: String },
+    Skip,
+}
+
 /// One page of `GET /v1/sync/pull`: records with a `seq` above the cursor, in `seq` order.
 /// `total` is the user's number of live records, for progress. `more` is true when the page
 /// stopped at the size limit; the page after it can be empty.
@@ -637,5 +661,57 @@ mod tests {
             serde_json::from_value::<ExtractResponse>(json).unwrap(),
             response
         );
+    }
+
+    #[test]
+    fn reconcile_bodies_use_the_wire_field_names() {
+        let request = ReconcileRequest {
+            candidate: Candidate {
+                text: "Uses pnpm".to_owned(),
+                scope: Scope::Project,
+                kind: Kind::Decision,
+            },
+            neighbours: vec![Neighbour {
+                memory_id: "01KA0000000000000000000001".to_owned(),
+                text: "Uses npm".to_owned(),
+            }],
+        };
+        let json = serde_json::json!({
+            "candidate": {"text": "Uses pnpm", "scope": "project", "kind": "decision"},
+            "neighbours": [{"memory_id": "01KA0000000000000000000001", "text": "Uses npm"}],
+        });
+        assert_eq!(serde_json::to_value(&request).unwrap(), json);
+        assert_eq!(
+            serde_json::from_value::<ReconcileRequest>(json).unwrap(),
+            request
+        );
+        let decisions = [
+            (
+                ReconcileResponse::Add,
+                serde_json::json!({"decision": "add"}),
+            ),
+            (
+                ReconcileResponse::Skip,
+                serde_json::json!({"decision": "skip"}),
+            ),
+            (
+                ReconcileResponse::Supersede {
+                    memory_id: "01KA0000000000000000000001".to_owned(),
+                    text: "Uses pnpm, not npm".to_owned(),
+                },
+                serde_json::json!({
+                    "decision": "supersede",
+                    "memory_id": "01KA0000000000000000000001",
+                    "text": "Uses pnpm, not npm",
+                }),
+            ),
+        ];
+        for (decision, json) in decisions {
+            assert_eq!(serde_json::to_value(&decision).unwrap(), json);
+            assert_eq!(
+                serde_json::from_value::<ReconcileResponse>(json).unwrap(),
+                decision
+            );
+        }
     }
 }
