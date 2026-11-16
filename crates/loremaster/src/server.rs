@@ -18,6 +18,7 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use crate::config::{self, Paths, create_private_dir};
 use crate::embed::{self, EmbedError, Embedder};
+use crate::pipeline::{self, Pipeline};
 use crate::project::ProjectIds;
 use crate::recall::{Recall, RecallError, Recalled};
 use crate::redact::Redactor;
@@ -102,6 +103,7 @@ struct Capturer {
     recall: Arc<Recall>,
     projects: Arc<ProjectIds>,
     redactor: Redactor,
+    turns: pipeline::Wake,
 }
 
 impl CaptureError {
@@ -160,6 +162,7 @@ impl Capturer {
                 next_offset,
                 now_ms: now_ms(),
             })?;
+            self.turns.wake();
             position = next_offset;
         }
         if end != position {
@@ -468,10 +471,14 @@ async fn run_async(paths: &Paths) -> Result<(), DaemonError> {
     let listener = bind_socket(&paths.sock())?;
     let recall = Arc::new(Recall::new(Store::open(&paths.store_db())?)?);
     let projects = Arc::new(ProjectIds::default());
+    let sync = SyncClient::new(recall.clone(), paths.clone()).spawn(Cadence::DAEMON);
+    let extraction = Pipeline::new(recall.clone(), paths.clone())
+        .spawn(pipeline::Cadence::DAEMON, sync.triggers());
     let mut capturer = Capturer {
         recall: recall.clone(),
         projects: projects.clone(),
         redactor: Redactor::new(paths.config_toml()),
+        turns: extraction.wake(),
     };
     // Neither failure is worth losing recall over: what they skipped stays in the spool or behind
     // the transcript offset, for the next start or the next event.
@@ -504,7 +511,6 @@ async fn run_async(paths: &Paths) -> Result<(), DaemonError> {
         paths.credentials(),
         load_gate.clone(),
     );
-    let sync = SyncClient::new(recall.clone(), paths.clone()).spawn(Cadence::DAEMON);
     let daemon = Arc::new(Daemon {
         recall,
         projects,
@@ -547,6 +553,9 @@ async fn run_async(paths: &Paths) -> Result<(), DaemonError> {
     worker
         .join()
         .map_err(|_| io::Error::other("capture worker panicked"))?;
+    extraction
+        .stop()
+        .map_err(|_| io::Error::other("pipeline thread panicked"))?;
     sync.stop()
         .map_err(|_| io::Error::other("sync thread panicked"))?;
     match fs::remove_file(paths.sock()) {

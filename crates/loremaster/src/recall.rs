@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 
-use loremaster_core::{Kind, PullResponse, Record, RecordType, Scope};
+use loremaster_core::{Candidate, Kind, Neighbour, PullResponse, Record, RecordType, Scope};
 
 use crate::embed::{EmbedError, Embedder, MODEL_ID};
 use crate::index::{DimMismatch, Index};
@@ -24,6 +24,8 @@ const MAX_PROMPT_CANDIDATES: usize = 200;
 const PROFILE_HALF_LIFE_DAYS: f64 = 90.0;
 const EPISODE_HALF_LIFE_DAYS: f64 = 30.0;
 const MS_PER_DAY: f64 = 86_400_000.0;
+/// How many stored facts a new fact is compared with.
+const MAX_NEIGHBOURS: usize = 5;
 
 /// Why recall could not answer.
 #[derive(Debug, thiserror::Error)]
@@ -116,6 +118,13 @@ impl ProfileSection {
         output.push(self.title);
         output.extend(self.lines.into_iter().map(|(_, line)| line));
     }
+}
+
+/// The stored facts closest to a text, best first, and the text's vector.
+#[derive(Debug)]
+pub struct Neighbours {
+    pub vector: Vec<f32>,
+    pub nearest: Vec<(Neighbour, f32)>,
 }
 
 /// Memories chosen for injection: the text, and the ids to mark as injected once it has reached the
@@ -312,6 +321,113 @@ impl Recall {
             index.mark_not_live(id);
         }
         Ok(())
+    }
+
+    /// Whether the embedding model has loaded.
+    pub fn can_embed(&self) -> bool {
+        self.embedder.get().is_some()
+    }
+
+    /// The vector of a memory text. `None` until the embedding model has loaded.
+    pub fn embed(&self, text: &str) -> Result<Option<Vec<f32>>, RecallError> {
+        let Some(embedder) = self.embedder.get() else {
+            return Ok(None);
+        };
+        Ok(Some(embedder.embed(&[text])?.pop().unwrap_or_default()))
+    }
+
+    /// The live facts in `scope` closest to `text`: for project scope, facts of `project_id` only.
+    /// `None` until the embedding model has loaded.
+    pub fn neighbours(
+        &self,
+        text: &str,
+        scope: Scope,
+        project_id: &str,
+    ) -> Result<Option<Neighbours>, RecallError> {
+        let Some(vector) = self.embed(text)? else {
+            return Ok(None);
+        };
+        self.refresh_index()?;
+        let nearest: Vec<(String, f32)> = self
+            .index
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .nearest_facts(&vector, scope, project_id, MAX_NEIGHBOURS)
+            .into_iter()
+            .map(|(memory_id, score)| (memory_id.to_owned(), score))
+            .collect();
+        let store = self.store();
+        let mut found = Vec::with_capacity(nearest.len());
+        for (memory_id, score) in nearest {
+            // The index can be older than the store; a fact gone since is no neighbour.
+            if let Some(text) = store
+                .get_memory(&memory_id)?
+                .and_then(|memory| memory.record.text)
+            {
+                found.push((Neighbour { memory_id, text }, score));
+            }
+        }
+        Ok(Some(Neighbours {
+            vector,
+            nearest: found,
+        }))
+    }
+
+    /// Stores a new fact written on this device and queues it for push. With `supersedes`, the
+    /// fact replaces that one, which keeps its text; a fact already gone is not marked. Returns
+    /// the new fact's id.
+    pub fn write_fact(
+        &self,
+        candidate: &Candidate,
+        project_id: &str,
+        vector: Vec<f32>,
+        supersedes: Option<&str>,
+        writer: &str,
+    ) -> Result<String, RecallError> {
+        let now = crate::now_ms();
+        let memory_id = loremaster_core::new_ulid();
+        let fact = StoredMemory {
+            record: Record {
+                user_id: None,
+                memory_id: memory_id.clone(),
+                seq: None,
+                hlc: String::new(),
+                writer: String::new(),
+                record_type: Some(RecordType::Fact),
+                kind: Some(candidate.kind),
+                scope: Some(candidate.scope),
+                project_id: (candidate.scope == Scope::Project).then(|| project_id.to_owned()),
+                text: Some(candidate.text.clone()),
+                created_at: Some(now),
+                superseded_by: None,
+                deleted: false,
+                evict_key: None,
+            },
+            vector: Some(vector),
+            model_id: Some(MODEL_ID.to_owned()),
+        };
+        let mut written = vec![fact];
+        {
+            let store = self.store();
+            if let Some(old) = supersedes
+                .map(|id| store.get_memory(id))
+                .transpose()?
+                .flatten()
+                && !old.record.deleted
+                && old.record.superseded_by.is_none()
+            {
+                let mut old = old;
+                old.record.superseded_by = Some(memory_id.clone());
+                old.record.hlc = String::new();
+                written.push(old);
+            }
+            store.write_local(&mut written, writer, now)?;
+        }
+        let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
+        for memory in &written {
+            index.insert(memory)?;
+        }
+        Ok(memory_id)
     }
 
     /// Builds the session-start profile. Needs no embeddings, so it works before the model loads.

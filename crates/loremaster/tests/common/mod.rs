@@ -281,3 +281,19 @@ impl DeliveredRecall for loremaster::recall::Recall {
         Ok(Some(recalled.text))
     }
 }
+
+/// Swaps the config with a rename, so the sync loop never reads a half-written file.
+pub fn set_api_url(sandbox: &Sandbox, url: &str) {
+    let config = sandbox.paths.config_toml();
+    let temp = config.with_extension("toml.tmp");
+    fs::write(&temp, format!("api_url = \"{url}\"\n")).unwrap();
+    fs::rename(temp, config).unwrap();
+}
+
+pub fn save_credential(sandbox: &Sandbox, credential: &loremaster_core::DeviceCredential) {
+    fs::write(
+        sandbox.paths.credentials(),
+        serde_json::to_string(credential).unwrap(),
+    )
+    .unwrap();
+}

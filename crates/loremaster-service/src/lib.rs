@@ -1185,6 +1185,13 @@ fn check_reconcile(request: &ReconcileRequest) -> Result<(), ApiError> {
             "neighbour text must be 1 to {MAX_TEXT_CHARS} characters"
         ));
     }
+    // An id of any length would let the model input grow past what these limits allow.
+    if !neighbours
+        .iter()
+        .all(|neighbour| loremaster_core::is_ulid(&neighbour.memory_id))
+    {
+        return bad("neighbour memory_id must be a ULID".to_owned());
+    }
     let ids: HashSet<&str> = neighbours.iter().map(|n| n.memory_id.as_str()).collect();
     if ids.len() != neighbours.len() {
         return bad("neighbours must have different memory_id values".to_owned());

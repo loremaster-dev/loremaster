@@ -8,6 +8,7 @@ pub mod enable;
 pub mod hook;
 pub mod index;
 pub mod login;
+pub mod pipeline;
 pub mod project;
 pub mod recall;
 pub mod redact;

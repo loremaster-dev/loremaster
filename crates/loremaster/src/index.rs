@@ -134,15 +134,11 @@ impl Index {
             return Vec::new();
         };
         let fact = &self.rows[position];
-        let is_live_fact = |row: &Row| row.live && row.record_type == Some(RecordType::Fact);
-        let same_scope = |row: &Row| match fact.scope {
-            Some(Scope::User) => row.scope == Some(Scope::User),
-            Some(Scope::Project) => {
-                row.scope == Some(Scope::Project) && row.project_id == fact.project_id
-            }
-            None => false,
+        let Some(scope) = fact.scope else {
+            return Vec::new();
         };
-        if !is_live_fact(fact) {
+        let project_id = fact.project_id.as_deref();
+        if !fact.is_live_fact() {
             return Vec::new();
         }
         let vectors = self.vectors.as_chunks::<DIMENSIONS>().0;
@@ -153,12 +149,44 @@ impl Index {
             .enumerate()
             .filter(|&(other, (row, other_vector))| {
                 other != position
-                    && is_live_fact(row)
-                    && same_scope(row)
+                    && row.is_live_fact()
+                    && row.in_scope(scope, project_id)
                     && dot(vector, other_vector) >= DUPLICATE_SIMILARITY
             })
             .map(|(_, (row, _))| row.memory_id.as_str())
             .collect()
+    }
+
+    /// The `k` live facts in `scope` most similar to `vector`, best first. For project scope, only
+    /// facts of `project_id`.
+    pub fn nearest_facts(
+        &self,
+        vector: &[f32],
+        scope: Scope,
+        project_id: &str,
+        k: usize,
+    ) -> Vec<(&str, f32)> {
+        let mut nearest: Vec<(&str, f32)> = self
+            .rows
+            .iter()
+            .zip(self.vectors.as_chunks::<DIMENSIONS>().0)
+            .filter(|(row, _)| row.is_live_fact() && row.in_scope(scope, Some(project_id)))
+            .map(|(row, other)| (row.memory_id.as_str(), dot(vector, other)))
+            .collect();
+        nearest.sort_by(|a, b| b.1.total_cmp(&a.1));
+        nearest.truncate(k);
+        nearest
+    }
+}
+
+impl Row {
+    fn is_live_fact(&self) -> bool {
+        self.live && self.record_type == Some(RecordType::Fact)
+    }
+
+    fn in_scope(&self, scope: Scope, project_id: Option<&str>) -> bool {
+        self.scope == Some(scope)
+            && (scope == Scope::User || self.project_id.as_deref() == project_id)
     }
 }
 
@@ -363,6 +391,54 @@ mod tests {
         for id in ["D", "E", "episode"] {
             assert!(duplicates(&index, id).is_empty(), "{id}");
         }
+    }
+
+    fn nearest(index: &Index, scope: Scope, project_id: &str, k: usize) -> Vec<(String, f32)> {
+        index
+            .nearest_facts(&unit(0), scope, project_id, k)
+            .into_iter()
+            .map(|(id, score)| (id.to_owned(), score))
+            .collect()
+    }
+
+    #[test]
+    fn nearest_facts_are_live_facts_in_the_scope_best_first() {
+        let mut index = sample_index();
+        for (id, similarity, axis) in [("near", 0.9, 1), ("mid", 0.5, 2), ("low", 0.1, 3)] {
+            let mut row = memory(id, None);
+            row.vector = Some(toward(similarity, axis));
+            index.insert(&row).unwrap();
+        }
+        let mut episode = memory("episode", None);
+        episode.record.record_type = Some(RecordType::Episode);
+        index.insert(&episode).unwrap();
+        index.insert(&memory("gone", None)).unwrap();
+        index.mark_not_live("gone");
+
+        let found = nearest(&index, Scope::User, "github.com/a/x", 10);
+        let ids: Vec<&str> = found.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["A", "near", "mid", "low"]);
+        assert!((found[1].1 - 0.9).abs() < 1e-6);
+        let top: Vec<String> = nearest(&index, Scope::User, "github.com/a/x", 2)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(top, ["A", "near"]);
+        assert!(nearest(&index, Scope::User, "p", 0).is_empty());
+    }
+
+    #[test]
+    fn nearest_project_facts_are_from_that_project_only() {
+        let index = sample_index();
+        let ids = |project: &str| -> Vec<String> {
+            nearest(&index, Scope::Project, project, 5)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        assert_eq!(ids("github.com/a/x"), ["B"]);
+        assert_eq!(ids("github.com/a/y"), ["C"]);
+        assert!(ids("github.com/a/z").is_empty());
     }
 
     #[cfg(not(debug_assertions))]

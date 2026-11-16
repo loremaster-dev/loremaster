@@ -118,6 +118,8 @@ async fn bad_bodies_are_400() {
         request("Uses pnpm", &[(NPM, "")]),
         request("Uses pnpm", &[(NPM, &too_long)]),
         request("Uses pnpm", &[(NPM, "Uses npm"), (NPM, "Uses yarn")]),
+        request("Uses pnpm", &[("01KA00000000000000000000011", "Uses npm")]),
+        request("Uses pnpm", &[("npm", "Uses npm")]),
     ];
     for body in &bodies {
         let (status, _) = reconcile(&service, &device.token, body).await;

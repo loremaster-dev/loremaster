@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use common::fake_service::{FakeService, Route};
-use common::{DeliveredRecall, Sandbox, embedder, memory, request, wait_for};
+use common::{
+    DeliveredRecall, Sandbox, embedder, memory, request, save_credential, set_api_url, wait_for,
+};
 use loremaster::embed::MODEL_ID;
 use loremaster::now_ms;
 use loremaster::recall::Recall;
@@ -24,22 +26,6 @@ const QUICK: Cadence = Cadence {
     period: Duration::from_secs(3600),
     retry: Duration::from_millis(200),
 };
-
-/// Swaps the config with a rename, so the sync loop never reads a half-written file.
-fn set_api_url(sandbox: &Sandbox, url: &str) {
-    let config = sandbox.paths.config_toml();
-    let temp = config.with_extension("toml.tmp");
-    fs::write(&temp, format!("api_url = \"{url}\"\n")).unwrap();
-    fs::rename(temp, config).unwrap();
-}
-
-fn save_credential(sandbox: &Sandbox, credential: &DeviceCredential) {
-    fs::write(
-        sandbox.paths.credentials(),
-        serde_json::to_string(credential).unwrap(),
-    )
-    .unwrap();
-}
 
 /// A home logged in to `fake` as a new device of the user.
 fn home(fake: &FakeService, sandbox: Sandbox) -> (Sandbox, DeviceCredential) {

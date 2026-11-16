@@ -12,7 +12,7 @@ use rusqlite::{
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SCHEMA_V1: &str = "
     CREATE TABLE memories (
         memory_id TEXT PRIMARY KEY,
@@ -57,6 +57,8 @@ const SCHEMA_V1: &str = "
         PRIMARY KEY (session_id, memory_id)
     );
 ";
+/// Counts the failed tries of each queued turn, so one that always fails stops being tried.
+const SCHEMA_V2: &str = "ALTER TABLE turn_queue ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;";
 const MEMORY_COLUMNS: &str = "memory_id, type, kind, scope, project_id, text, created_at, hlc, \
     writer, superseded_by, deleted, seq, vector, model_id";
 const MEMORY_VALUES: &str = "?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14";
@@ -119,6 +121,34 @@ pub struct QueuedTurn<'a> {
     pub now_ms: i64,
 }
 
+/// A queued turn that still needs extraction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTurn {
+    pub id: i64,
+    pub session_id: String,
+    pub project_id: String,
+    pub turn: String,
+}
+
+/// Where a queued turn is in extraction. Rows stay queued in every status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnStatus {
+    Pending,
+    Extracted,
+    /// It cannot be extracted and is not tried again.
+    Failed,
+}
+
+impl TurnStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Extracted => "extracted",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// The device store.
 pub struct Store {
     conn: Connection,
@@ -152,7 +182,12 @@ impl Store {
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
         if version < 1 {
             conn.execute_batch(&format!(
-                "BEGIN; {SCHEMA_V1} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
+                "BEGIN; {SCHEMA_V1} PRAGMA user_version = 1; COMMIT;"
+            ))?;
+        }
+        if version < 2 {
+            conn.execute_batch(&format!(
+                "BEGIN; {SCHEMA_V2} PRAGMA user_version = 2; COMMIT;"
             ))?;
         }
         Ok(Self { conn })
@@ -487,6 +522,43 @@ impl Store {
         Ok(())
     }
 
+    /// The oldest queued turn that still needs extraction.
+    pub fn next_pending_turn(&self) -> Result<Option<PendingTurn>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, session_id, project_id, turn FROM turn_queue
+                 WHERE status = 'pending' ORDER BY id LIMIT 1",
+                [],
+                |row| {
+                    Ok(PendingTurn {
+                        id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        project_id: row.get(2)?,
+                        turn: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn set_turn_status(&self, id: i64, status: TurnStatus) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE turn_queue SET status = ?2 WHERE id = ?1",
+            params![id, status.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Counts one more failed try of a queued turn. Returns the count so far.
+    pub fn count_failed_attempt(&self, id: i64) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            "UPDATE turn_queue SET attempts = attempts + 1 WHERE id = ?1 RETURNING attempts",
+            [id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Marks a session as ended.
     pub fn end_session(&self, session_id: &str) -> Result<(), StoreError> {
         self.conn.execute(
@@ -696,7 +768,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
@@ -730,8 +802,45 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         assert!(store.get_memory("m1").unwrap().is_some());
+    }
+
+    #[test]
+    fn first_schema_store_gains_attempts_and_keeps_its_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "{SCHEMA_V1}
+                 INSERT INTO turn_queue (session_id, agent, project_id, turn, created_at)
+                 VALUES ('s1', 'claude-code', 'p', 'first', 1), ('s1', 'claude-code', 'p', 'second', 2);
+                 PRAGMA user_version = 1;"
+            ))
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let rows: Vec<(String, String, i64)> = store
+            .conn
+            .prepare("SELECT turn, status, attempts FROM turn_queue ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("first".to_owned(), "pending".to_owned(), 0),
+                ("second".to_owned(), "pending".to_owned(), 0),
+            ]
+        );
     }
 
     #[test]
@@ -831,15 +940,15 @@ mod tests {
         let path = dir.path().join("store.db");
         {
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch("CREATE TABLE t (a); PRAGMA user_version = 2;")
+            conn.execute_batch("CREATE TABLE t (a); PRAGMA user_version = 3;")
                 .unwrap();
         }
         let before = std::fs::read(&path).unwrap();
         assert!(matches!(
             Store::open(&path),
             Err(StoreError::SchemaTooNew {
-                found: 2,
-                supported: 1
+                found: 3,
+                supported: 2
             })
         ));
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -894,6 +1003,68 @@ mod tests {
             .query_row("SELECT status FROM turn_queue", [], |r| r.get(0))
             .unwrap();
         assert_eq!(status, "pending");
+    }
+
+    #[test]
+    fn pending_turns_come_oldest_first_until_their_status_changes() {
+        let (_dir, store) = open_temp();
+        store
+            .upsert_session("s1", "claude-code", "p", None)
+            .unwrap();
+        for (turn, next_offset) in [("first", 1), ("second", 2), ("third", 3)] {
+            store
+                .commit_turn(QueuedTurn {
+                    session_id: "s1",
+                    agent: "claude-code",
+                    project_id: "p",
+                    turn,
+                    next_offset,
+                    now_ms: 5,
+                })
+                .unwrap();
+        }
+        let first = store.next_pending_turn().unwrap().unwrap();
+        assert_eq!(
+            (
+                first.session_id.as_str(),
+                first.project_id.as_str(),
+                first.turn.as_str()
+            ),
+            ("s1", "p", "first")
+        );
+        assert_eq!(store.count_failed_attempt(first.id).unwrap(), 1);
+        assert_eq!(store.count_failed_attempt(first.id).unwrap(), 2);
+        assert_eq!(store.count_failed_attempt(first.id).unwrap(), 3);
+        assert_eq!(store.next_pending_turn().unwrap().unwrap().id, first.id);
+
+        store
+            .set_turn_status(first.id, TurnStatus::Extracted)
+            .unwrap();
+        let second = store.next_pending_turn().unwrap().unwrap();
+        assert_eq!(second.turn, "second");
+        store
+            .set_turn_status(second.id, TurnStatus::Failed)
+            .unwrap();
+        let third = store.next_pending_turn().unwrap().unwrap();
+        assert_eq!(third.turn, "third");
+        store
+            .set_turn_status(third.id, TurnStatus::Extracted)
+            .unwrap();
+        assert_eq!(store.next_pending_turn().unwrap(), None);
+
+        store
+            .set_turn_status(second.id, TurnStatus::Pending)
+            .unwrap();
+        assert_eq!(store.next_pending_turn().unwrap().unwrap().id, second.id);
+        let statuses: Vec<String> = store
+            .conn
+            .prepare("SELECT status FROM turn_queue ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(statuses, ["extracted", "pending", "extracted"]);
     }
 
     #[test]

@@ -182,7 +182,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
       - Same meaning as a neighbour → SKIP.
       - Related topic, different fact → ADD.
       - User over 5M tokens today → 429.
-  - F3. Facts from turns: `Pipeline` takes `turn_queue` to `memories`, with reconcile, outbox and retry. Docs: design, tasks. Needs: F2. Status: not started.
+  - F3. Facts from turns: `Pipeline` takes `turn_queue` to `memories`, with reconcile, outbox and retry. Docs: design, tasks. Needs: F2. Status: done.
     - Verify (Dev stack for the first case, a stub service for the others):
       - Stop hook on a turn stating a preference, new session, relevant prompt → recall probe returns the fact. [approval]
       - Candidate with similarity >= 0.95 to a same-scope fact → no new row.
