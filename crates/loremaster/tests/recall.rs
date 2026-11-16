@@ -5,7 +5,7 @@ use loremaster::embed::MODEL_ID;
 use loremaster::now_ms;
 use loremaster::recall::Recall;
 use loremaster::store::{Store, StoredMemory};
-use loremaster_core::{Kind, estimate_tokens};
+use loremaster_core::{Candidate, Kind, RecordType, Scope, estimate_tokens};
 
 const WEB: &str = "github.com/acme/web";
 const DEPLOY: &str = "Deploys go through ArgoCD, not manual kubectl";
@@ -488,4 +488,195 @@ fn profile_reports_which_memories_it_used() {
     let mut ids = recall.profile(WEB, now_ms()).unwrap().unwrap().memory_ids;
     ids.sort();
     assert_eq!(ids, expected);
+}
+
+fn pnpm_candidate() -> Candidate {
+    Candidate {
+        text: "Prefers pnpm over npm for installs".to_owned(),
+        scope: Scope::User,
+        kind: Kind::Preference,
+    }
+}
+
+#[test]
+fn neighbours_are_the_closest_live_facts_of_the_scope_with_their_text() {
+    let mut memories = sample();
+    let model = embedder();
+    memories.push(memory(
+        &model,
+        None,
+        None,
+        "Tried pnpm workspaces",
+        now_ms(),
+    ));
+    let (_sandbox, recall) = recall_with(&memories);
+    let found = recall
+        .neighbours("Prefers pnpm over npm for installs", Scope::User, WEB)
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.vector.len(), 384);
+    let texts: Vec<&str> = found
+        .nearest
+        .iter()
+        .map(|(neighbour, _)| neighbour.text.as_str())
+        .collect();
+    assert_eq!(texts, ["Prefers pnpm over npm"]);
+    assert_eq!(found.nearest[0].0.memory_id, memories[0].record.memory_id);
+    assert!(found.nearest[0].1 > 0.75, "{}", found.nearest[0].1);
+
+    let project = recall
+        .neighbours(DEPLOY, Scope::Project, WEB)
+        .unwrap()
+        .unwrap();
+    assert_eq!(project.nearest.len(), 1);
+    assert_eq!(project.nearest[0].0.text, DEPLOY);
+    let other = recall
+        .neighbours(DEPLOY, Scope::Project, "github.com/acme/api")
+        .unwrap()
+        .unwrap();
+    assert!(other.nearest.is_empty());
+}
+
+#[test]
+fn neighbours_need_the_model() {
+    let (_sandbox, store) = store_with(&sample());
+    let recall = Recall::new(store).unwrap();
+    assert!(
+        recall
+            .neighbours("anything", Scope::User, WEB)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn a_written_fact_is_queued_and_recallable() {
+    let (_sandbox, recall) = recall_with(&[]);
+    let candidate = pnpm_candidate();
+    let vector = recall
+        .neighbours(&candidate.text, Scope::User, WEB)
+        .unwrap()
+        .unwrap()
+        .vector;
+    let id = recall
+        .write_fact(&candidate, WEB, vector, None, "dev_laptop")
+        .unwrap();
+    let store = recall.store();
+    let stored = store.get_memory(&id).unwrap().unwrap();
+    assert_eq!(stored.record.text.as_deref(), Some(candidate.text.as_str()));
+    assert_eq!(stored.record.kind, Some(Kind::Preference));
+    assert_eq!(stored.record.scope, Some(Scope::User));
+    assert_eq!(stored.record.project_id, None);
+    assert_eq!(stored.record.record_type, Some(RecordType::Fact));
+    assert_eq!(stored.record.writer, "dev_laptop");
+    assert!(!stored.record.hlc.is_empty());
+    assert_eq!(stored.model_id.as_deref(), Some(MODEL_ID));
+    let queued: Vec<String> = store
+        .outbox_batch(10)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.record.memory_id)
+        .collect();
+    assert_eq!(queued, [id.as_str()]);
+    drop(store);
+    let recalled = recall
+        .for_prompt("s1", WEB, "should I use pnpm or npm?", now_ms())
+        .unwrap()
+        .unwrap();
+    assert_eq!(recalled.memory_ids, [id]);
+}
+
+#[test]
+fn a_project_fact_carries_the_project() {
+    let (_sandbox, recall) = recall_with(&[]);
+    let candidate = Candidate {
+        text: DEPLOY.to_owned(),
+        scope: Scope::Project,
+        kind: Kind::Decision,
+    };
+    let vector = recall
+        .neighbours(DEPLOY, Scope::Project, WEB)
+        .unwrap()
+        .unwrap()
+        .vector;
+    let id = recall
+        .write_fact(&candidate, WEB, vector, None, "dev_laptop")
+        .unwrap();
+    let stored = recall.store().get_memory(&id).unwrap().unwrap();
+    assert_eq!(stored.record.project_id.as_deref(), Some(WEB));
+}
+
+#[test]
+fn superseding_marks_the_old_fact_and_keeps_its_text() {
+    let old = sample().remove(0);
+    let old_id = old.record.memory_id.clone();
+    let (_sandbox, recall) = recall_with(&[old]);
+    let candidate = Candidate {
+        text: "Prefers bun over pnpm and npm".to_owned(),
+        ..pnpm_candidate()
+    };
+    let vector = recall
+        .neighbours(&candidate.text, Scope::User, WEB)
+        .unwrap()
+        .unwrap()
+        .vector;
+    let id = recall
+        .write_fact(&candidate, WEB, vector, Some(&old_id), "dev_laptop")
+        .unwrap();
+    let store = recall.store();
+    let marked = store.get_memory(&old_id).unwrap().unwrap();
+    assert_eq!(marked.record.superseded_by.as_deref(), Some(id.as_str()));
+    assert_eq!(marked.record.text.as_deref(), Some("Prefers pnpm over npm"));
+    assert_eq!(marked.record.writer, "dev_laptop");
+    assert_ne!(marked.record.hlc, "1761750000123-00000-test");
+    let mut queued: Vec<String> = store
+        .outbox_batch(10)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.record.memory_id)
+        .collect();
+    queued.sort();
+    let mut expected = vec![old_id.clone(), id.clone()];
+    expected.sort();
+    assert_eq!(queued, expected);
+    drop(store);
+    let recalled = recall
+        .for_prompt("s1", WEB, "which package manager do I prefer?", now_ms())
+        .unwrap()
+        .unwrap();
+    assert_eq!(recalled.memory_ids, [id]);
+}
+
+#[test]
+fn superseding_a_fact_that_is_gone_adds_the_new_one() {
+    let mut deleted = sample().remove(0);
+    deleted.record.deleted = true;
+    deleted.record.text = None;
+    let mut replaced = sample().remove(0);
+    replaced.record.superseded_by = Some("01KA0000000000000000000009".to_owned());
+    let (_sandbox, recall) = recall_with(&[deleted.clone(), replaced.clone()]);
+    for gone in [
+        &deleted,
+        &replaced,
+        &memory(&embedder(), Some(Kind::Preference), None, "x", 1),
+    ] {
+        let gone_id = &gone.record.memory_id;
+        let candidate = pnpm_candidate();
+        let vector = recall
+            .neighbours(&candidate.text, Scope::User, WEB)
+            .unwrap()
+            .unwrap()
+            .vector;
+        let id = recall
+            .write_fact(&candidate, WEB, vector, Some(gone_id), "dev_laptop")
+            .unwrap();
+        let store = recall.store();
+        assert!(store.get_memory(&id).unwrap().is_some());
+        let after = store.get_memory(gone_id).unwrap();
+        let before = [&deleted, &replaced]
+            .into_iter()
+            .find(|m| &m.record.memory_id == gone_id)
+            .map(|m| m.record.clone());
+        assert_eq!(after.map(|m| m.record), before);
+    }
 }

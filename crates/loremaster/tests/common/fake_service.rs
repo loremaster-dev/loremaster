@@ -1,5 +1,6 @@
-//! A sync service in memory: per-user `seq`, newer `hlc` wins, pages of a fixed size. Replies can
-//! be scripted to test failures.
+//! A sync service in memory: per-user `seq`, newer `hlc` wins, pages of a fixed size. Extract and
+//! reconcile find nothing and add unless a reply is scripted. Replies can be scripted to test
+//! failures.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -11,11 +12,13 @@ use axum::{Json, Router};
 use loremaster_core::{DeviceCredential, PullResponse, PushRequest, PushResponse, Record};
 use serde_json::{Value, json};
 
-/// A sync route, for scripted replies and request counts.
+/// A route, for scripted replies and request counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Route {
     Push,
     Pull,
+    Extract,
+    Reconcile,
 }
 
 #[derive(Default)]
@@ -36,6 +39,8 @@ struct FakeState {
     fail_after: HashMap<Route, usize>,
     pushes: Vec<Value>,
     pull_cursors: Vec<i64>,
+    /// Extract and reconcile bodies as sent.
+    bodies: HashMap<Route, Vec<Value>>,
 }
 
 type Shared = Arc<Mutex<FakeState>>;
@@ -55,6 +60,8 @@ impl FakeService {
         let app = Router::new()
             .route("/v1/sync/push", post(push))
             .route("/v1/sync/pull", get(pull))
+            .route("/v1/extract", post(extract))
+            .route("/v1/reconcile", post(reconcile))
             .with_state(state.clone());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -152,6 +159,17 @@ impl FakeService {
     /// Push bodies as sent.
     pub fn pushes(&self) -> Vec<Value> {
         self.state.lock().unwrap().pushes.clone()
+    }
+
+    /// Extract or reconcile bodies as sent, in order.
+    pub fn bodies(&self, route: Route) -> Vec<Value> {
+        self.state
+            .lock()
+            .unwrap()
+            .bodies
+            .get(&route)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Stores records as if a device of `user` had pushed them.
@@ -277,4 +295,47 @@ async fn pull(
         records,
     };
     (StatusCode::OK, Json(serde_json::to_value(page).unwrap()))
+}
+
+async fn extract(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    model_call(
+        &state,
+        Route::Extract,
+        &headers,
+        body,
+        json!({"candidates": []}),
+    )
+}
+
+async fn reconcile(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    model_call(
+        &state,
+        Route::Reconcile,
+        &headers,
+        body,
+        json!({"decision": "add"}),
+    )
+}
+
+fn model_call(
+    state: &Shared,
+    route: Route,
+    headers: &HeaderMap,
+    body: Value,
+    reply: Value,
+) -> (StatusCode, Json<Value>) {
+    let mut state = state.lock().unwrap();
+    state.bodies.entry(route).or_default().push(body);
+    match begin(&mut state, route, headers) {
+        Ok(_) => (StatusCode::OK, Json(reply)),
+        Err(reply) => reply,
+    }
 }
