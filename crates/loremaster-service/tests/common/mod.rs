@@ -406,7 +406,7 @@ impl FakeModel {
 
 /// Serves `POST /v1/messages` and calls the forced tool. The tool input is the one set with
 /// `FakeModel::reply_next`, or else a prefix or a marker from above picks it, or else it is one
-/// preference fact for extract and an add for reconcile.
+/// preference fact for extract, an add for reconcile and a pnpm switch for episode.
 async fn fake_model(seen: Arc<FakeModel>) -> String {
     async fn messages(
         State(seen): State<Arc<FakeModel>>,
@@ -458,6 +458,12 @@ async fn fake_model(seen: Arc<FakeModel>) -> String {
                 (Some(input), _) => input,
                 (None, Some(json)) => serde_json::from_str(json).unwrap(),
                 (None, None) if tool == "record_decision" => serde_json::json!({"decision": "add"}),
+                (None, None) if tool == "record_episode" => serde_json::json!({
+                    "task_attempted": true,
+                    "attempted": "Switch the project to pnpm",
+                    "worked": "pnpm import",
+                    "failed": "",
+                }),
                 (None, None) => serde_json::json!({"candidates": [
                     {"text": "Prefers pnpm over npm", "scope": "user", "kind": "preference"}
                 ]}),

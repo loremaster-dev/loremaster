@@ -178,11 +178,15 @@ impl Capturer {
             tracing::error!(session = %job.session_id, error = %e, "capture failed");
             retry = !e.is_permanent();
         }
-        if job.verb == Verb::SessionEnd
-            && let Err(e) = self.recall.store().end_session(&job.session_id)
-        {
-            tracing::error!(session = %job.session_id, error = %e, "cannot end session");
-            retry = true;
+        if job.verb == Verb::SessionEnd {
+            match self.recall.store().end_session(&job.session_id) {
+                // The session's episode is due now.
+                Ok(()) => self.turns.wake(),
+                Err(e) => {
+                    tracing::error!(session = %job.session_id, error = %e, "cannot end session");
+                    retry = true;
+                }
+            }
         }
         retry
     }

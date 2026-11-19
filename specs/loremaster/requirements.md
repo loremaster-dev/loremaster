@@ -81,7 +81,7 @@ Capture
 - FR14. Loremaster MUST process every turn for new memories, with no user action.
 - FR15. On the eval set, Loremaster MUST store at least 80% of labeled expected memories, and stored memories labeled junk MUST NOT exceed 20% (temporary task state, content visible in code or git history, generic knowledge, restated agent actions, pleasantries).
 - FR16. Every memory MUST have user or project scope. A project-scoped memory MUST carry the project ID of its session's working directory.
-- FR17. Every session MUST produce exactly one episode recording what was attempted, what worked and what failed. Episodes MUST be project-scoped.
+- FR17. Every session in which a task was attempted MUST produce exactly one episode recording what was attempted, what worked and what failed. A session with no turns MUST NOT produce an episode. Episodes MUST be project-scoped. Details: M4 F4 `requirements.md`.
 - FR18. Loremaster MUST NOT create memories longer than 2,000 characters.
 - FR19. Processing turns for new memories MUST NOT require anything from the user beyond the Loremaster login: no extra API key, account or per-call charge. Turns not yet processed MUST NOT be lost.
 

@@ -12,7 +12,7 @@ use rusqlite::{
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const SCHEMA_V1: &str = "
     CREATE TABLE memories (
         memory_id TEXT PRIMARY KEY,
@@ -59,6 +59,9 @@ const SCHEMA_V1: &str = "
 ";
 /// Counts the failed tries of each queued turn, so one that always fails stops being tried.
 const SCHEMA_V2: &str = "ALTER TABLE turn_queue ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;";
+/// Counts the failed episode tries of each session, so one that always fails stops being tried.
+const SCHEMA_V3: &str =
+    "ALTER TABLE sessions ADD COLUMN episode_attempts INTEGER NOT NULL DEFAULT 0;";
 const MEMORY_COLUMNS: &str = "memory_id, type, kind, scope, project_id, text, created_at, hlc, \
     writer, superseded_by, deleted, seq, vector, model_id";
 const MEMORY_VALUES: &str = "?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14";
@@ -130,6 +133,15 @@ pub struct PendingTurn {
     pub turn: String,
 }
 
+/// A session whose queued turns are ready to become an episode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueEpisode {
+    pub session_id: String,
+    pub project_id: String,
+    /// Queue ids and prepared turns, oldest first.
+    pub turns: Vec<(i64, String)>,
+}
+
 /// Where a queued turn is in extraction. Rows stay queued in every status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnStatus {
@@ -190,6 +202,11 @@ impl Store {
                 "BEGIN; {SCHEMA_V2} PRAGMA user_version = 2; COMMIT;"
             ))?;
         }
+        if version < 3 {
+            conn.execute_batch(&format!(
+                "BEGIN; {SCHEMA_V3} PRAGMA user_version = 3; COMMIT;"
+            ))?;
+        }
         Ok(Self { conn })
     }
 
@@ -222,31 +239,50 @@ impl Store {
         writer: &str,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        // Immediate: the clock is read, then written, and another process may write it too.
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let mut clock = read_clock(&tx, writer)?;
-        {
-            let mut insert = tx.prepare_cached(&format!(
-                "INSERT OR REPLACE INTO memories ({MEMORY_COLUMNS}) VALUES ({MEMORY_VALUES})"
-            ))?;
-            // A row already queued keeps its place, so the oldest change is pushed first.
-            let mut queue =
-                tx.prepare_cached("INSERT OR IGNORE INTO outbox (memory_id) VALUES (?1)")?;
-            for memory in memories.iter_mut() {
-                let record = &mut memory.record;
-                if record.hlc.is_empty() {
-                    record.hlc = clock.tick(now_ms.max(0) as u64);
-                } else {
-                    observe(&mut clock, &record.hlc);
-                }
-                record.writer = writer.to_owned();
-                execute_with_memory(&mut insert, memory)?;
-                queue.execute([&memory.record.memory_id])?;
-            }
-        }
-        save_state(&tx, CLOCK_KEY, &clock.to_string())?;
+        let tx = self.clock_transaction()?;
+        write_local_in(&tx, memories, writer, now_ms)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Stores the facts a queued turn gave as a local write and marks the turn extracted, in one
+    /// transaction, so a turn is never half written. Each `(old, new)` in `supersedes` marks
+    /// `old` as replaced by `new` if `old` is still live when the transaction runs; a marked
+    /// row is added to `memories`.
+    pub fn finish_turn(
+        &self,
+        turn_id: i64,
+        memories: &mut Vec<StoredMemory>,
+        supersedes: &[(String, String)],
+        writer: &str,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let tx = self.clock_transaction()?;
+        // Read inside the transaction: a pull may have deleted or replaced the old fact since
+        // the turn was decided, and writing an older copy would undo that.
+        for (old_id, new_id) in supersedes {
+            if let Some(mut old) = self.get_memory(old_id)?
+                && !old.record.deleted
+                && old.record.superseded_by.is_none()
+            {
+                old.record.superseded_by = Some(new_id.clone());
+                old.record.hlc = String::new();
+                memories.push(old);
+            }
+        }
+        write_local_in(&tx, memories, writer, now_ms)?;
+        tx.execute(
+            "UPDATE turn_queue SET status = ?2 WHERE id = ?1",
+            params![turn_id, TurnStatus::Extracted.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A transaction that holds the write lock from its start.
+    fn clock_transaction(&self) -> rusqlite::Result<Transaction<'_>> {
+        // Immediate: the clock is read, then written, and another process may write it too.
+        Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
     }
 
     /// Stores each pulled memory whose `hlc` is newer than the local copy, the cursor after the
@@ -515,7 +551,8 @@ impl Store {
             ],
         )?;
         tx.execute(
-            "UPDATE sessions SET transcript_offset = ?2, last_turn_at = ?3 WHERE session_id = ?1",
+            "UPDATE sessions SET transcript_offset = ?2, last_turn_at = ?3, ended = 0
+             WHERE session_id = ?1",
             params![turn.session_id, turn.next_offset as i64, turn.now_ms],
         )?;
         tx.commit()?;
@@ -559,6 +596,92 @@ impl Store {
         )?)
     }
 
+    /// The session with the oldest queued row whose rows are all past extraction, if it has ended
+    /// or had no turn for `idle_ms`. Its rows come oldest first.
+    pub fn due_episode(&self, now_ms: i64, idle_ms: i64) -> Result<Option<DueEpisode>, StoreError> {
+        // One statement, so a row queued meanwhile cannot slip in unextracted.
+        let mut query = self.conn.prepare_cached(
+            "WITH due AS (
+                 SELECT session_id, sessions.project_id FROM turn_queue
+                 JOIN sessions USING (session_id)
+                 GROUP BY session_id
+                 HAVING sum(status = 'pending') = 0
+                     AND (sessions.ended = 1 OR sessions.last_turn_at <= ?1 - ?2)
+                 ORDER BY min(turn_queue.id) LIMIT 1
+             )
+             SELECT due.session_id, due.project_id, turn_queue.id, turn_queue.turn
+             FROM due JOIN turn_queue USING (session_id) ORDER BY turn_queue.id",
+        )?;
+        let mut rows = query.query(params![now_ms, idle_ms])?;
+        let mut due: Option<DueEpisode> = None;
+        while let Some(row) = rows.next()? {
+            let turn = (row.get(2)?, row.get(3)?);
+            match &mut due {
+                Some(due) => due.turns.push(turn),
+                None => {
+                    due = Some(DueEpisode {
+                        session_id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        turns: vec![turn],
+                    })
+                }
+            }
+        }
+        Ok(due)
+    }
+
+    /// The earliest time an open session with queued rows becomes due by `idle_ms`.
+    pub fn next_episode_at(&self, idle_ms: i64) -> Result<Option<i64>, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT min(last_turn_at) + ?1 FROM sessions
+             WHERE ended = 0
+                 AND EXISTS (SELECT 1 FROM turn_queue WHERE turn_queue.session_id = sessions.session_id)",
+            [idle_ms],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Counts one more failed episode try of a session. Returns the count so far.
+    pub fn count_episode_failure(&self, session_id: &str) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            "UPDATE sessions SET episode_attempts = episode_attempts + 1 WHERE session_id = ?1
+             RETURNING episode_attempts",
+            [session_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Stores a session's episode, if any, as a local write, deletes the queued rows it was made
+    /// from and resets the session's failure count, in one transaction.
+    pub fn finish_episode(
+        &self,
+        session_id: &str,
+        turn_ids: &[i64],
+        episode: Option<&mut StoredMemory>,
+        writer: &str,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let tx = self.clock_transaction()?;
+        write_local_in(
+            &tx,
+            episode.map_or(&mut [], std::slice::from_mut),
+            writer,
+            now_ms,
+        )?;
+        {
+            let mut delete = tx.prepare_cached("DELETE FROM turn_queue WHERE id = ?1")?;
+            for id in turn_ids {
+                delete.execute([id])?;
+            }
+        }
+        tx.execute(
+            "UPDATE sessions SET episode_attempts = 0 WHERE session_id = ?1",
+            [session_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Marks a session as ended.
     pub fn end_session(&self, session_id: &str) -> Result<(), StoreError> {
         self.conn.execute(
@@ -599,6 +722,34 @@ impl Store {
             .conn
             .query_row("PRAGMA data_version", [], |row| row.get(0))?)
     }
+}
+
+/// The body of a local write, inside the caller's transaction.
+fn write_local_in(
+    tx: &Transaction<'_>,
+    memories: &mut [StoredMemory],
+    writer: &str,
+    now_ms: i64,
+) -> Result<(), StoreError> {
+    let mut clock = read_clock(tx, writer)?;
+    let mut insert = tx.prepare_cached(&format!(
+        "INSERT OR REPLACE INTO memories ({MEMORY_COLUMNS}) VALUES ({MEMORY_VALUES})"
+    ))?;
+    // A row already queued keeps its place, so the oldest change is pushed first.
+    let mut queue = tx.prepare_cached("INSERT OR IGNORE INTO outbox (memory_id) VALUES (?1)")?;
+    for memory in memories.iter_mut() {
+        let record = &mut memory.record;
+        if record.hlc.is_empty() {
+            record.hlc = clock.tick(now_ms.max(0) as u64);
+        } else {
+            observe(&mut clock, &record.hlc);
+        }
+        record.writer = writer.to_owned();
+        execute_with_memory(&mut insert, memory)?;
+        queue.execute([&memory.record.memory_id])?;
+    }
+    save_state(tx, CLOCK_KEY, &clock.to_string())?;
+    Ok(())
 }
 
 fn execute_with_memory(
@@ -768,7 +919,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
@@ -802,7 +953,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         assert!(store.get_memory("m1").unwrap().is_some());
     }
 
@@ -825,7 +976,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let rows: Vec<(String, String, i64)> = store
             .conn
             .prepare("SELECT turn, status, attempts FROM turn_queue ORDER BY id")
@@ -940,15 +1091,15 @@ mod tests {
         let path = dir.path().join("store.db");
         {
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch("CREATE TABLE t (a); PRAGMA user_version = 3;")
+            conn.execute_batch("CREATE TABLE t (a); PRAGMA user_version = 4;")
                 .unwrap();
         }
         let before = std::fs::read(&path).unwrap();
         assert!(matches!(
             Store::open(&path),
             Err(StoreError::SchemaTooNew {
-                found: 3,
-                supported: 2
+                found: 4,
+                supported: 3
             })
         ));
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -1003,6 +1154,112 @@ mod tests {
             .query_row("SELECT status FROM turn_queue", [], |r| r.get(0))
             .unwrap();
         assert_eq!(status, "pending");
+    }
+
+    #[test]
+    fn finishing_a_turn_stores_its_facts_and_marks_it_extracted_together() {
+        let (_dir, store) = open_temp();
+        store
+            .upsert_session("s1", "claude-code", "p", None)
+            .unwrap();
+        store
+            .commit_turn(QueuedTurn {
+                session_id: "s1",
+                agent: "claude-code",
+                project_id: "p",
+                turn: "{}",
+                next_offset: 1,
+                now_ms: 5,
+            })
+            .unwrap();
+        let turn = store.next_pending_turn().unwrap().unwrap();
+        let mut facts = vec![fact("A"), fact("B")];
+        store
+            .finish_turn(turn.id, &mut facts, &[], "dev_laptop", 10)
+            .unwrap();
+        assert!(store.next_pending_turn().unwrap().is_none());
+        assert_eq!(store.outbox_count().unwrap(), 2);
+        let stored = store.get_memory("A").unwrap().unwrap();
+        assert_eq!(stored.record.writer, "dev_laptop");
+        assert!(!stored.record.hlc.is_empty());
+        assert_eq!(
+            facts[1].record.hlc,
+            store.get_memory("B").unwrap().unwrap().record.hlc
+        );
+    }
+
+    #[test]
+    fn finishing_a_turn_marks_only_old_facts_that_are_still_live() {
+        let (_dir, store) = open_temp();
+        let mut gone = fact("GONE");
+        gone.record.deleted = true;
+        let mut replaced = fact("REPLACED");
+        replaced.record.superseded_by = Some("OTHER".to_owned());
+        store
+            .put_memories(&[fact("LIVE"), gone.clone(), replaced.clone()])
+            .unwrap();
+        store
+            .upsert_session("s1", "claude-code", "p", None)
+            .unwrap();
+        store
+            .commit_turn(QueuedTurn {
+                session_id: "s1",
+                agent: "claude-code",
+                project_id: "p",
+                turn: "{}",
+                next_offset: 1,
+                now_ms: 5,
+            })
+            .unwrap();
+        let turn = store.next_pending_turn().unwrap().unwrap();
+        let mut facts = vec![fact("N1"), fact("N2"), fact("N3")];
+        let supersedes = [
+            ("LIVE".to_owned(), "N1".to_owned()),
+            ("GONE".to_owned(), "N2".to_owned()),
+            ("REPLACED".to_owned(), "N3".to_owned()),
+            ("MISSING".to_owned(), "N3".to_owned()),
+        ];
+        store
+            .finish_turn(turn.id, &mut facts, &supersedes, "dev_laptop", 10)
+            .unwrap();
+        let live = store.get_memory("LIVE").unwrap().unwrap();
+        assert_eq!(live.record.superseded_by.as_deref(), Some("N1"));
+        assert_eq!(live.record.writer, "dev_laptop");
+        assert_eq!(
+            store.get_memory("GONE").unwrap().unwrap().record,
+            gone.record
+        );
+        assert_eq!(
+            store.get_memory("REPLACED").unwrap().unwrap().record,
+            replaced.record
+        );
+        assert!(store.get_memory("MISSING").unwrap().is_none());
+        assert_eq!(facts.len(), 4);
+        assert_eq!(store.outbox_count().unwrap(), 4);
+    }
+
+    #[test]
+    fn finishing_a_turn_with_no_facts_marks_it_extracted() {
+        let (_dir, store) = open_temp();
+        store
+            .upsert_session("s1", "claude-code", "p", None)
+            .unwrap();
+        store
+            .commit_turn(QueuedTurn {
+                session_id: "s1",
+                agent: "claude-code",
+                project_id: "p",
+                turn: "{}",
+                next_offset: 1,
+                now_ms: 5,
+            })
+            .unwrap();
+        let turn = store.next_pending_turn().unwrap().unwrap();
+        store
+            .finish_turn(turn.id, &mut Vec::new(), &[], "dev_laptop", 10)
+            .unwrap();
+        assert!(store.next_pending_turn().unwrap().is_none());
+        assert_eq!(store.outbox_count().unwrap(), 0);
     }
 
     #[test]
@@ -1248,6 +1505,11 @@ mod tests {
         assert!(store.set_vector("m1", "h", &[1.0], "m").is_err());
         assert!(store.outbox_batch(1).is_err());
         assert!(store.remove_pushed(&[("m1", "h")]).is_err());
+        assert!(store.due_episode(1, 1).is_err());
+        assert!(store.next_episode_at(1).is_err());
+        assert!(store.count_episode_failure("s").is_err());
+        assert!(store.finish_episode("s", &[1], None, "w", 1).is_err());
+        assert!(store.finish_turn(1, &mut Vec::new(), &[], "w", 1).is_err());
 
         store
             .conn
@@ -1547,5 +1809,277 @@ mod tests {
         );
         assert_eq!(store.hlc_of("m1").unwrap(), Some(hlc));
         assert_eq!(store.hlc_of("m9").unwrap(), None);
+    }
+
+    #[test]
+    fn second_schema_store_gains_episode_attempts_and_keeps_its_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "{SCHEMA_V1} {SCHEMA_V2}
+                 INSERT INTO sessions (session_id, agent, project_id, last_turn_at, ended)
+                 VALUES ('s1', 'claude-code', 'p', 7, 1);
+                 PRAGMA user_version = 2;"
+            ))
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let (version, attempts): (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT (SELECT user_version FROM pragma_user_version), episode_attempts FROM sessions",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((version, attempts), (3, 0));
+        let session = store.get_session("s1").unwrap().unwrap();
+        assert_eq!(
+            (
+                session.project_id.as_str(),
+                session.last_turn_at,
+                session.ended
+            ),
+            ("p", Some(7), true)
+        );
+    }
+
+    fn queue(store: &Store, session_id: &str, turn: &str, now_ms: i64) {
+        store
+            .commit_turn(QueuedTurn {
+                session_id,
+                agent: "claude-code",
+                project_id: "ignored",
+                turn,
+                next_offset: 1,
+                now_ms,
+            })
+            .unwrap();
+    }
+
+    fn mark_all(store: &Store, status: TurnStatus) {
+        store
+            .conn
+            .execute("UPDATE turn_queue SET status = ?1", [status.as_str()])
+            .unwrap();
+    }
+
+    fn queued_turns(store: &Store) -> Vec<String> {
+        store
+            .conn
+            .prepare("SELECT turn FROM turn_queue ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_turn_reopens_an_ended_session() {
+        let (_dir, store) = open_temp();
+        store
+            .upsert_session("s1", "claude-code", "p", None)
+            .unwrap();
+        store.end_session("s1").unwrap();
+        queue(&store, "s1", "after", 5);
+        assert!(!store.get_session("s1").unwrap().unwrap().ended);
+    }
+
+    const IDLE: i64 = 1_000;
+
+    #[test]
+    fn no_queued_rows_means_no_episode() {
+        let (_dir, store) = open_temp();
+        store
+            .upsert_session("s1", "claude-code", "p", None)
+            .unwrap();
+        store.end_session("s1").unwrap();
+        assert_eq!(store.due_episode(i64::MAX / 2, IDLE).unwrap(), None);
+        assert_eq!(store.next_episode_at(IDLE).unwrap(), None);
+    }
+
+    #[test]
+    fn a_pending_row_holds_the_session_back() {
+        let (_dir, store) = open_temp();
+        store
+            .upsert_session("s1", "claude-code", "p", None)
+            .unwrap();
+        queue(&store, "s1", "first", 5);
+        mark_all(&store, TurnStatus::Extracted);
+        queue(&store, "s1", "second", 6);
+        store.end_session("s1").unwrap();
+        assert_eq!(store.due_episode(6 + IDLE, IDLE).unwrap(), None);
+    }
+
+    #[test]
+    fn an_ended_session_is_due_at_once_with_its_rows_in_order() {
+        let (_dir, store) = open_temp();
+        store
+            .upsert_session("s1", "claude-code", "p", None)
+            .unwrap();
+        for (turn, at) in [("first", 5), ("second", 6), ("third", 7)] {
+            queue(&store, "s1", turn, at);
+        }
+        mark_all(&store, TurnStatus::Extracted);
+        store
+            .conn
+            .execute(
+                "UPDATE turn_queue SET status = 'failed' WHERE turn = 'second'",
+                [],
+            )
+            .unwrap();
+        store.end_session("s1").unwrap();
+
+        let due = store.due_episode(7, IDLE).unwrap().unwrap();
+        assert_eq!(due.session_id, "s1");
+        assert_eq!(due.project_id, "p");
+        let turns: Vec<&str> = due.turns.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(turns, ["first", "second", "third"]);
+        assert!(due.turns.is_sorted_by_key(|(id, _)| *id));
+    }
+
+    #[test]
+    fn an_open_session_is_due_after_the_idle_time_from_its_last_turn() {
+        let (_dir, store) = open_temp();
+        store
+            .upsert_session("s1", "claude-code", "p", None)
+            .unwrap();
+        queue(&store, "s1", "first", 5);
+        queue(&store, "s1", "second", 100);
+        mark_all(&store, TurnStatus::Extracted);
+        assert_eq!(store.next_episode_at(IDLE).unwrap(), Some(100 + IDLE));
+        assert_eq!(store.due_episode(100 + IDLE - 1, IDLE).unwrap(), None);
+        let due = store.due_episode(100 + IDLE, IDLE).unwrap().unwrap();
+        assert_eq!(due.session_id, "s1");
+        assert_eq!(due.turns.len(), 2);
+    }
+
+    #[test]
+    fn the_session_with_the_oldest_row_is_due_first() {
+        let (_dir, store) = open_temp();
+        for session in ["late", "early"] {
+            store
+                .upsert_session(session, "claude-code", session, None)
+                .unwrap();
+        }
+        queue(&store, "early", "a", 5);
+        queue(&store, "late", "b", 6);
+        mark_all(&store, TurnStatus::Extracted);
+        store.end_session("late").unwrap();
+        store.end_session("early").unwrap();
+        assert_eq!(
+            store.due_episode(6, IDLE).unwrap().unwrap().project_id,
+            "early"
+        );
+    }
+
+    #[test]
+    fn next_episode_at_skips_ended_sessions_and_sessions_with_no_rows() {
+        let (_dir, store) = open_temp();
+        for session in ["ended", "empty", "open"] {
+            store
+                .upsert_session(session, "claude-code", "p", None)
+                .unwrap();
+        }
+        queue(&store, "ended", "a", 5);
+        queue(&store, "empty", "b", 6);
+        queue(&store, "open", "c", 300);
+        store.end_session("ended").unwrap();
+        store
+            .conn
+            .execute("DELETE FROM turn_queue WHERE session_id = 'empty'", [])
+            .unwrap();
+        assert_eq!(store.next_episode_at(IDLE).unwrap(), Some(300 + IDLE));
+    }
+
+    #[test]
+    fn episode_failures_are_counted_per_session_and_reset_when_finished() {
+        let (_dir, store) = open_temp();
+        for session in ["s1", "s2"] {
+            store
+                .upsert_session(session, "claude-code", "p", None)
+                .unwrap();
+        }
+        assert_eq!(store.count_episode_failure("s1").unwrap(), 1);
+        assert_eq!(store.count_episode_failure("s1").unwrap(), 2);
+        assert_eq!(store.count_episode_failure("s1").unwrap(), 3);
+        assert_eq!(store.count_episode_failure("s2").unwrap(), 1);
+        store.finish_episode("s1", &[], None, "dev_a", 1).unwrap();
+        assert_eq!(store.count_episode_failure("s1").unwrap(), 1);
+    }
+
+    #[test]
+    fn finishing_an_episode_stores_it_and_deletes_only_the_sent_rows() {
+        let (_dir, store) = open_temp();
+        store
+            .upsert_session("s1", "claude-code", "p", None)
+            .unwrap();
+        queue(&store, "s1", "sent", 5);
+        queue(&store, "s1", "later", 6);
+        let sent = store.next_pending_turn().unwrap().unwrap().id;
+        let mut episode = unstamped("e1");
+        episode.record.record_type = Some(RecordType::Episode);
+
+        store
+            .finish_episode("s1", &[sent], Some(&mut episode), "dev_a", 1761750000123)
+            .unwrap();
+
+        assert_eq!(episode.record.hlc, "1761750000123-00000-dev_a");
+        assert_eq!(store.get_memory("e1").unwrap().unwrap(), episode);
+        assert_eq!(outbox(&store), ["e1"]);
+        assert_eq!(queued_turns(&store), ["later"]);
+    }
+
+    #[test]
+    fn finishing_with_no_episode_writes_no_memory() {
+        let (_dir, store) = open_temp();
+        store
+            .upsert_session("s1", "claude-code", "p", None)
+            .unwrap();
+        queue(&store, "s1", "sent", 5);
+        let sent = store.next_pending_turn().unwrap().unwrap().id;
+        store
+            .finish_episode("s1", &[sent], None, "dev_a", 1)
+            .unwrap();
+        let mut memories = 0;
+        store.for_each_memory(|_| memories += 1).unwrap();
+        assert_eq!(memories, 0);
+        assert!(outbox(&store).is_empty());
+        assert!(queued_turns(&store).is_empty());
+    }
+
+    #[test]
+    fn a_failed_finish_keeps_the_rows_and_writes_nothing() {
+        let (_dir, store) = open_temp();
+        store
+            .upsert_session("s1", "claude-code", "p", None)
+            .unwrap();
+        queue(&store, "s1", "sent", 5);
+        let sent = store.next_pending_turn().unwrap().unwrap().id;
+        store.count_episode_failure("s1").unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_update BEFORE UPDATE ON sessions
+                 BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
+        let mut episode = unstamped("e1");
+        assert!(
+            store
+                .finish_episode("s1", &[sent], Some(&mut episode), "dev_a", 1)
+                .is_err()
+        );
+        store
+            .conn
+            .execute_batch("DROP TRIGGER fail_update")
+            .unwrap();
+        assert_eq!(store.get_memory("e1").unwrap(), None);
+        assert!(outbox(&store).is_empty());
+        assert_eq!(queued_turns(&store), ["sent"]);
+        assert_eq!(store.count_episode_failure("s1").unwrap(), 2);
     }
 }

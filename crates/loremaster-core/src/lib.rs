@@ -261,6 +261,19 @@ pub enum ReconcileResponse {
     Skip,
 }
 
+/// Body of `POST /v1/episode`: the prepared turns of one session, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpisodeRequest {
+    pub turns: Vec<String>,
+}
+
+/// Reply to an episode: what the session attempted, what worked and what failed, or `None` when
+/// the session attempted no task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpisodeResponse {
+    pub episode: Option<String>,
+}
+
 /// One page of `GET /v1/sync/pull`: records with a `seq` above the cursor, in `seq` order.
 /// `total` is the user's number of live records, for progress. `more` is true when the page
 /// stopped at the size limit; the page after it can be empty.
@@ -661,6 +674,38 @@ mod tests {
             serde_json::from_value::<ExtractResponse>(json).unwrap(),
             response
         );
+    }
+
+    #[test]
+    fn episode_bodies_use_the_wire_field_names() {
+        let request = EpisodeRequest {
+            turns: vec!["first".to_owned(), "second".to_owned()],
+        };
+        let json = serde_json::json!({"turns": ["first", "second"]});
+        assert_eq!(serde_json::to_value(&request).unwrap(), json);
+        assert_eq!(
+            serde_json::from_value::<EpisodeRequest>(json).unwrap(),
+            request
+        );
+        let replies = [
+            (
+                EpisodeResponse {
+                    episode: Some("Attempted: a\nWorked: b\nFailed: none".to_owned()),
+                },
+                serde_json::json!({"episode": "Attempted: a\nWorked: b\nFailed: none"}),
+            ),
+            (
+                EpisodeResponse { episode: None },
+                serde_json::json!({"episode": null}),
+            ),
+        ];
+        for (response, json) in replies {
+            assert_eq!(serde_json::to_value(&response).unwrap(), json);
+            assert_eq!(
+                serde_json::from_value::<EpisodeResponse>(json).unwrap(),
+                response
+            );
+        }
     }
 
     #[test]

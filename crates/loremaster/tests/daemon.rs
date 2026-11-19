@@ -87,13 +87,13 @@ fn newer_store_schema_refuses_to_start() {
     let sandbox = Sandbox::with_model();
     {
         let conn = rusqlite::Connection::open(sandbox.paths.store_db()).unwrap();
-        conn.execute_batch("PRAGMA user_version = 3").unwrap();
+        conn.execute_batch("PRAGMA user_version = 4").unwrap();
     }
     let output = sandbox.daemon_command().output().unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         String::from_utf8_lossy(&output.stderr).trim(),
-        "store.db is from a newer Loremaster (schema 3)"
+        "store.db is from a newer Loremaster (schema 4)"
     );
 }
 

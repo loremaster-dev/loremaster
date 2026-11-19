@@ -3,8 +3,8 @@ mod common;
 use common::{DeliveredRecall, Sandbox, embedder, memory};
 use loremaster::embed::MODEL_ID;
 use loremaster::now_ms;
-use loremaster::recall::Recall;
-use loremaster::store::{Store, StoredMemory};
+use loremaster::recall::{Recall, TurnFacts};
+use loremaster::store::{QueuedTurn, Store, StoredMemory};
 use loremaster_core::{Candidate, Kind, RecordType, Scope, estimate_tokens};
 
 const WEB: &str = "github.com/acme/web";
@@ -549,6 +549,120 @@ fn neighbours_need_the_model() {
     );
 }
 
+/// Writes one fact as the only result of a queued turn, as the pipeline does.
+fn write(
+    recall: &Recall,
+    candidate: &Candidate,
+    vector: Vec<f32>,
+    supersedes: Option<&str>,
+) -> String {
+    let turn_id = queue_turn(recall);
+    let mut facts = TurnFacts::default();
+    let id = recall
+        .add_fact(&mut facts, candidate, WEB, vector, supersedes)
+        .unwrap();
+    recall.finish_turn(turn_id, facts, "dev_laptop").unwrap();
+    id
+}
+
+fn queue_turn(recall: &Recall) -> i64 {
+    let store = recall.store();
+    store
+        .upsert_session("s1", "claude-code", WEB, None)
+        .unwrap();
+    store
+        .commit_turn(QueuedTurn {
+            session_id: "s1",
+            agent: "claude-code",
+            project_id: WEB,
+            turn: "{}",
+            next_offset: 0,
+            now_ms: now_ms(),
+        })
+        .unwrap();
+    store.next_pending_turn().unwrap().unwrap().id
+}
+
+#[test]
+fn a_fact_replaced_twice_in_one_turn_is_marked_once() {
+    let old = sample().remove(0);
+    let old_id = old.record.memory_id.clone();
+    let (_sandbox, recall) = recall_with(&[old]);
+    let turn_id = queue_turn(&recall);
+    let mut facts = TurnFacts::default();
+    let mut ids = Vec::new();
+    for text in ["Prefers bun over pnpm and npm", "Prefers bun for scripts"] {
+        let candidate = Candidate {
+            text: text.to_owned(),
+            ..pnpm_candidate()
+        };
+        let vector = recall.embed(text).unwrap().unwrap();
+        ids.push(
+            recall
+                .add_fact(&mut facts, &candidate, WEB, vector, Some(&old_id))
+                .unwrap(),
+        );
+    }
+    recall.finish_turn(turn_id, facts, "dev_laptop").unwrap();
+    let store = recall.store();
+    let marked = store.get_memory(&old_id).unwrap().unwrap();
+    assert_eq!(
+        marked.record.superseded_by.as_deref(),
+        Some(ids[0].as_str())
+    );
+    for id in &ids {
+        assert!(
+            store
+                .get_memory(id)
+                .unwrap()
+                .unwrap()
+                .record
+                .superseded_by
+                .is_none()
+        );
+    }
+    assert_eq!(store.outbox_count().unwrap(), 3);
+    assert!(store.next_pending_turn().unwrap().is_none());
+}
+
+#[test]
+fn a_fact_deleted_before_the_turn_is_written_stays_deleted() {
+    let old = sample().remove(0);
+    let old_id = old.record.memory_id.clone();
+    let (_sandbox, recall) = recall_with(std::slice::from_ref(&old));
+    let turn_id = queue_turn(&recall);
+    let mut facts = TurnFacts::default();
+    let candidate = Candidate {
+        text: "Prefers bun over pnpm and npm".to_owned(),
+        ..pnpm_candidate()
+    };
+    let vector = recall.embed(&candidate.text).unwrap().unwrap();
+    let id = recall
+        .add_fact(&mut facts, &candidate, WEB, vector, Some(&old_id))
+        .unwrap();
+    // A pull deletes the old fact while the turn is still being decided.
+    let mut deleted = old;
+    deleted.record.deleted = true;
+    deleted.record.text = None;
+    deleted.record.hlc = "1761750000999-00000-other".to_owned();
+    recall.store().put_memories(&[deleted.clone()]).unwrap();
+
+    recall.finish_turn(turn_id, facts, "dev_laptop").unwrap();
+    let store = recall.store();
+    assert_eq!(
+        store.get_memory(&old_id).unwrap().unwrap().record,
+        deleted.record
+    );
+    assert!(store.get_memory(&id).unwrap().is_some());
+    let queued: Vec<String> = store
+        .outbox_batch(10)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.record.memory_id)
+        .collect();
+    assert_eq!(queued, [id.as_str()]);
+}
+
 #[test]
 fn a_written_fact_is_queued_and_recallable() {
     let (_sandbox, recall) = recall_with(&[]);
@@ -558,9 +672,7 @@ fn a_written_fact_is_queued_and_recallable() {
         .unwrap()
         .unwrap()
         .vector;
-    let id = recall
-        .write_fact(&candidate, WEB, vector, None, "dev_laptop")
-        .unwrap();
+    let id = write(&recall, &candidate, vector, None);
     let store = recall.store();
     let stored = store.get_memory(&id).unwrap().unwrap();
     assert_eq!(stored.record.text.as_deref(), Some(candidate.text.as_str()));
@@ -599,9 +711,7 @@ fn a_project_fact_carries_the_project() {
         .unwrap()
         .unwrap()
         .vector;
-    let id = recall
-        .write_fact(&candidate, WEB, vector, None, "dev_laptop")
-        .unwrap();
+    let id = write(&recall, &candidate, vector, None);
     let stored = recall.store().get_memory(&id).unwrap().unwrap();
     assert_eq!(stored.record.project_id.as_deref(), Some(WEB));
 }
@@ -620,9 +730,7 @@ fn superseding_marks_the_old_fact_and_keeps_its_text() {
         .unwrap()
         .unwrap()
         .vector;
-    let id = recall
-        .write_fact(&candidate, WEB, vector, Some(&old_id), "dev_laptop")
-        .unwrap();
+    let id = write(&recall, &candidate, vector, Some(&old_id));
     let store = recall.store();
     let marked = store.get_memory(&old_id).unwrap().unwrap();
     assert_eq!(marked.record.superseded_by.as_deref(), Some(id.as_str()));
@@ -667,9 +775,7 @@ fn superseding_a_fact_that_is_gone_adds_the_new_one() {
             .unwrap()
             .unwrap()
             .vector;
-        let id = recall
-            .write_fact(&candidate, WEB, vector, Some(gone_id), "dev_laptop")
-            .unwrap();
+        let id = write(&recall, &candidate, vector, Some(gone_id));
         let store = recall.store();
         assert!(store.get_memory(&id).unwrap().is_some());
         let after = store.get_memory(gone_id).unwrap();
