@@ -164,6 +164,27 @@ fn a_candidate_that_is_already_stored_is_skipped() {
 }
 
 #[test]
+fn a_near_copy_within_one_turn_is_stored_once() {
+    let fake = FakeService::start(100);
+    let mut home = Home::new(&fake, &[]);
+    home.queue(WEB, "{}");
+    script_extract(
+        &fake,
+        &[
+            candidate(PNPM, "user"),
+            candidate(PNPM, "user"),
+            candidate(PNPM, "project"),
+        ],
+    );
+    assert_eq!(home.pipeline.process_next().unwrap(), Step::Handled);
+    let scopes: Vec<_> = home.facts().iter().map(|fact| fact.scope).collect();
+    assert_eq!(scopes.len(), 2);
+    assert!(scopes.contains(&Some(Scope::User)));
+    assert!(scopes.contains(&Some(Scope::Project)));
+    assert_eq!(fake.requests(Route::Reconcile), 0);
+}
+
+#[test]
 fn the_same_text_in_another_scope_or_project_is_new() {
     let fake = FakeService::start(100);
     let mut home = Home::new(&fake, &[stored_fact(PNPM, Some("github.com/acme/api"))]);
@@ -579,6 +600,28 @@ fn a_captured_turn_wakes_an_idle_pipeline() {
     // The queue is empty now, so only a wake from the capture starts the pipeline again soon.
     assert_eq!(sandbox.ask(&stop), "{}");
     wait_for(|| count(&sandbox, "extracted") == 4, "the captured turns");
+}
+
+#[test]
+fn a_session_end_wakes_an_idle_pipeline() {
+    let fake = FakeService::start(100);
+    let (sandbox, stop) = daemon_home(&fake);
+    set_api_url(&sandbox, &fake.url);
+    let dir = sandbox.dir.path().join("agent");
+    let session_end = request(
+        "session_end",
+        AGENT,
+        &hook_input(AGENT, "session_end.json", &dir, None),
+    );
+    script_episode(&fake, Some(EPISODE));
+    let _daemon = sandbox.start_daemon();
+    assert_eq!(sandbox.ask(&stop), "{}");
+    wait_for(|| count(&sandbox, "extracted") == 3, "the captured turns");
+    assert_eq!(fake.requests(Route::Episode), 0);
+
+    // The session's end adds no turn, so only its own wake starts the episode soon.
+    assert_eq!(sandbox.ask(&session_end), "{}");
+    wait_for(|| fake.requests(Route::Episode) == 1, "the episode");
 }
 
 #[test]

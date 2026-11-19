@@ -178,7 +178,8 @@ impl Capturer {
             tracing::error!(session = %job.session_id, error = %e, "capture failed");
             retry = !e.is_permanent();
         }
-        if job.verb == Verb::SessionEnd {
+        // A retried job ends the session after its turns are in, so they share one episode.
+        if job.verb == Verb::SessionEnd && !retry {
             match self.recall.store().end_session(&job.session_id) {
                 // The session's episode is due now.
                 Ok(()) => self.turns.wake(),

@@ -301,6 +301,9 @@ impl Pipeline {
             .recall
             .neighbours(&candidate.text, candidate.scope, &turn.project_id)?
             .expect(MODEL_LOADED);
+        if facts.has_near_copy(&found.vector, candidate.scope) {
+            return Ok(());
+        }
         let top = found.nearest.first().map_or(f32::MIN, |(_, score)| *score);
         let supersedes = if top >= DUPLICATE_SIMILARITY {
             return Ok(());
@@ -366,17 +369,8 @@ impl Pipeline {
         let reply: EpisodeResponse = self
             .call(target, "/v1/episode", &request)
             .map_err(TurnError::Call)?;
-        let turn_ids: Vec<i64> = due.turns.iter().map(|(id, _)| *id).collect();
-        let writer = &target.credential.device_id;
         let Some(text) = reply.episode else {
-            self.recall.store().finish_episode(
-                &due.session_id,
-                &turn_ids,
-                None,
-                writer,
-                crate::now_ms(),
-            )?;
-            return Ok(());
+            return Ok(self.drop_episode(target, due)?);
         };
         let text = text.trim();
         if !(1..=MAX_FACT_CHARS).contains(&text.chars().count()) {
@@ -391,10 +385,21 @@ impl Pipeline {
             vector,
             &due.project_id,
             &due.session_id,
-            &turn_ids,
-            writer,
+            &due.turn_ids(),
+            &target.credential.device_id,
         )?;
         Ok(())
+    }
+
+    /// Deletes the session's queued turns with no episode.
+    fn drop_episode(&self, target: &Target, due: &DueEpisode) -> Result<(), PipelineError> {
+        Ok(self.recall.store().finish_episode(
+            &due.session_id,
+            &due.turn_ids(),
+            None,
+            &target.credential.device_id,
+            crate::now_ms(),
+        )?)
     }
 
     /// Keeps the session's turns for a retry, or gives its episode up when they are the cause.
@@ -419,14 +424,7 @@ impl Pipeline {
             }
         };
         tracing::error!(session = %due.session_id, %reason, "giving up an episode");
-        let turn_ids: Vec<i64> = due.turns.iter().map(|(id, _)| *id).collect();
-        self.recall.store().finish_episode(
-            &due.session_id,
-            &turn_ids,
-            None,
-            &target.credential.device_id,
-            crate::now_ms(),
-        )?;
+        self.drop_episode(target, due)?;
         Ok(Step::Handled)
     }
 

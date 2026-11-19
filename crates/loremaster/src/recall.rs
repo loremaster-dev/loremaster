@@ -8,7 +8,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 use loremaster_core::{Candidate, Kind, Neighbour, PullResponse, Record, RecordType, Scope};
 
 use crate::embed::{EmbedError, Embedder, MODEL_ID};
-use crate::index::{DimMismatch, Index};
+use crate::index::{DUPLICATE_SIMILARITY, DimMismatch, Index, dot};
 use crate::store::{Store, StoreError, StoredMemory};
 
 const PROFILE_HEADER: &str =
@@ -126,6 +126,19 @@ pub struct TurnFacts {
     rows: Vec<StoredMemory>,
     /// Old fact id, then the id of the new fact that replaces it.
     supersedes: Vec<(String, String)>,
+}
+
+impl TurnFacts {
+    /// True when a fact already decided for the turn, in `scope`, is a near copy of `vector`.
+    pub fn has_near_copy(&self, vector: &[f32], scope: Scope) -> bool {
+        self.rows.iter().any(|row| {
+            row.record.scope == Some(scope)
+                && row
+                    .vector
+                    .as_deref()
+                    .is_some_and(|other| dot(vector, other) >= DUPLICATE_SIMILARITY)
+        })
+    }
 }
 
 /// The stored facts closest to a text, best first, and the text's vector.

@@ -142,6 +142,12 @@ pub struct DueEpisode {
     pub turns: Vec<(i64, String)>,
 }
 
+impl DueEpisode {
+    pub fn turn_ids(&self) -> Vec<i64> {
+        self.turns.iter().map(|(id, _)| *id).collect()
+    }
+}
+
 /// Where a queued turn is in extraction. Rows stay queued in every status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnStatus {

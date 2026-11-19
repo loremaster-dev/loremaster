@@ -830,11 +830,15 @@ fn a_failed_capture_while_running_is_kept_for_the_next_start() {
         "{}"
     );
     wait_for(|| sandbox.paths.spool().exists(), "job kept in the spool");
+    // Ending the session now would give its episode without the turns still to come.
+    let ended = "SELECT ended FROM sessions";
+    assert_eq!(sandbox.query_i64(ended), 0);
     daemon.terminate();
     conn.execute_batch("DROP TRIGGER fail_queue").unwrap();
 
     let _daemon = sandbox.start_daemon();
     assert_eq!(sandbox.turns().len(), 3);
+    assert_eq!(sandbox.query_i64(ended), 1);
     assert!(!sandbox.paths.spool().exists());
 }
 
