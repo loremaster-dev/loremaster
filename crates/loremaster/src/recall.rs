@@ -120,6 +120,14 @@ impl ProfileSection {
     }
 }
 
+/// The new and replaced facts of one queued turn, written together by [`Recall::finish_turn`].
+#[derive(Debug, Default)]
+pub struct TurnFacts {
+    rows: Vec<StoredMemory>,
+    /// Old fact id, then the id of the new fact that replaces it.
+    supersedes: Vec<(String, String)>,
+}
+
 /// The stored facts closest to a text, best first, and the text's vector.
 #[derive(Debug)]
 pub struct Neighbours {
@@ -373,20 +381,19 @@ impl Recall {
         }))
     }
 
-    /// Stores a new fact written on this device and queues it for push. With `supersedes`, the
-    /// fact replaces that one, which keeps its text; a fact already gone is not marked. Returns
-    /// the new fact's id.
-    pub fn write_fact(
+    /// Adds a new fact to `facts`, which `finish_turn` writes. With `supersedes`, the fact
+    /// replaces that one, which keeps its text; a fact already replaced in `facts`, or gone by
+    /// the time `finish_turn` writes, is not marked. Returns the new fact's id.
+    pub fn add_fact(
         &self,
+        facts: &mut TurnFacts,
         candidate: &Candidate,
         project_id: &str,
         vector: Vec<f32>,
         supersedes: Option<&str>,
-        writer: &str,
     ) -> Result<String, RecallError> {
-        let now = crate::now_ms();
         let memory_id = loremaster_core::new_ulid();
-        let fact = StoredMemory {
+        facts.rows.push(StoredMemory {
             record: Record {
                 user_id: None,
                 memory_id: memory_id.clone(),
@@ -398,6 +405,71 @@ impl Recall {
                 scope: Some(candidate.scope),
                 project_id: (candidate.scope == Scope::Project).then(|| project_id.to_owned()),
                 text: Some(candidate.text.clone()),
+                created_at: Some(crate::now_ms()),
+                superseded_by: None,
+                deleted: false,
+                evict_key: None,
+            },
+            vector: Some(vector),
+            model_id: Some(MODEL_ID.to_owned()),
+        });
+        if let Some(old_id) = supersedes
+            && !facts.supersedes.iter().any(|(old, _)| old == old_id)
+        {
+            facts
+                .supersedes
+                .push((old_id.to_owned(), memory_id.clone()));
+        }
+        Ok(memory_id)
+    }
+
+    /// Stores the facts of a queued turn, queues them for push and marks the turn extracted, in
+    /// one write.
+    pub fn finish_turn(
+        &self,
+        turn_id: i64,
+        mut facts: TurnFacts,
+        writer: &str,
+    ) -> Result<(), RecallError> {
+        self.store().finish_turn(
+            turn_id,
+            &mut facts.rows,
+            &facts.supersedes,
+            writer,
+            crate::now_ms(),
+        )?;
+        let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
+        for memory in &facts.rows {
+            index.insert(memory)?;
+        }
+        Ok(())
+    }
+
+    /// Stores the episode of a session, queues it for push and deletes the queued turns it was
+    /// made from, in one write. Returns the episode's id.
+    pub fn write_episode(
+        &self,
+        text: &str,
+        vector: Vec<f32>,
+        project_id: &str,
+        session_id: &str,
+        turn_ids: &[i64],
+        writer: &str,
+    ) -> Result<String, RecallError> {
+        let now = crate::now_ms();
+        let memory_id = loremaster_core::new_ulid();
+        let mut episode = StoredMemory {
+            record: Record {
+                user_id: None,
+                memory_id: memory_id.clone(),
+                seq: None,
+                hlc: String::new(),
+                writer: String::new(),
+                record_type: Some(RecordType::Episode),
+                kind: None,
+                scope: Some(Scope::Project),
+                project_id: Some(project_id.to_owned()),
+                text: Some(text.to_owned()),
                 created_at: Some(now),
                 superseded_by: None,
                 deleted: false,
@@ -406,27 +478,12 @@ impl Recall {
             vector: Some(vector),
             model_id: Some(MODEL_ID.to_owned()),
         };
-        let mut written = vec![fact];
-        {
-            let store = self.store();
-            if let Some(old) = supersedes
-                .map(|id| store.get_memory(id))
-                .transpose()?
-                .flatten()
-                && !old.record.deleted
-                && old.record.superseded_by.is_none()
-            {
-                let mut old = old;
-                old.record.superseded_by = Some(memory_id.clone());
-                old.record.hlc = String::new();
-                written.push(old);
-            }
-            store.write_local(&mut written, writer, now)?;
-        }
-        let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
-        for memory in &written {
-            index.insert(memory)?;
-        }
+        self.store()
+            .finish_episode(session_id, turn_ids, Some(&mut episode), writer, now)?;
+        self.index
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(&episode)?;
         Ok(memory_id)
     }
 

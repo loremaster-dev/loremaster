@@ -29,9 +29,9 @@ use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use lambda_http::request::LambdaRequest;
 use loremaster_core::{
-    Device, DeviceCredential, DeviceLimitReached, DeviceList, ExtractRequest, ExtractResponse, Hlc,
-    PullResponse, PushRequest, PushResponse, ReconcileRequest, ReconcileResponse, Record,
-    RecordType, RegisterDevice, Scope,
+    Device, DeviceCredential, DeviceLimitReached, DeviceList, EpisodeRequest, EpisodeResponse,
+    ExtractRequest, ExtractResponse, Hlc, PullResponse, PushRequest, PushResponse,
+    ReconcileRequest, ReconcileResponse, Record, RecordType, RegisterDevice, Scope,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -47,6 +47,7 @@ const MAX_PUSH_RECORDS: usize = 99;
 const SERVER_WRITER: &str = "server";
 const MAX_TEXT_CHARS: usize = 2_000;
 const MAX_TURN_TOKENS: usize = 32_000;
+const MAX_EPISODE_TOKENS: usize = 100_000;
 const MAX_NEIGHBOURS: usize = 5;
 const DAILY_TOKEN_CAP: u64 = 5_000_000;
 const DAY_MS: u64 = 86_400_000;
@@ -164,6 +165,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sync/push", post(push_records))
         .route("/v1/extract", post(extract))
         .route("/v1/reconcile", post(reconcile))
+        .route("/v1/episode", post(episode))
         .route("/v1/sync/pull", get(pull_records))
         .route("/v1/account", delete(delete_account))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
@@ -191,6 +193,8 @@ enum ApiError {
     Conflict,
     #[error("turn is over {MAX_TURN_TOKENS} tokens")]
     TurnTooLarge,
+    #[error("turns are over {MAX_EPISODE_TOKENS} tokens")]
+    TurnsTooLarge,
     #[error("daily token limit reached")]
     DailyCap,
     #[error("model is unavailable")]
@@ -217,7 +221,7 @@ impl IntoResponse for ApiError {
                 return (StatusCode::CONFLICT, Json(body)).into_response();
             }
             Self::Conflict | Self::DeletionInProgress => StatusCode::CONFLICT,
-            Self::TurnTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::TurnTooLarge | Self::TurnsTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::DailyCap => StatusCode::TOO_MANY_REQUESTS,
             Self::ModelUnavailable => StatusCode::BAD_GATEWAY,
             Self::ModelBusy => StatusCode::SERVICE_UNAVAILABLE,
@@ -1163,6 +1167,45 @@ async fn reconcile(
     .await?;
     add_tokens(&state, &user_id, &utc_day(now_ms()?), reply.input_tokens).await?;
     Ok(Json(llm::decision(reply.tool_input, &request.neighbours)?))
+}
+
+/// Sums up one session as what it attempted, what worked and what failed. It shares the daily
+/// token budget with extract.
+async fn episode(
+    State(state): State<AppState>,
+    Extension(Caller { user_id, .. }): Extension<Caller>,
+    body: Result<Json<EpisodeRequest>, JsonRejection>,
+) -> Result<Json<EpisodeResponse>, ApiError> {
+    let Json(request) = body.map_err(|rejection| ApiError::BadRequest(rejection.body_text()))?;
+    if request.turns.is_empty() {
+        return Err(ApiError::BadRequest(
+            "an episode has 1 or more turns".to_owned(),
+        ));
+    }
+    if request.turns.iter().any(|turn| turn.trim().is_empty()) {
+        return Err(ApiError::BadRequest("a turn is empty".to_owned()));
+    }
+    let tokens: usize = request
+        .turns
+        .iter()
+        .map(|turn| loremaster_core::estimate_tokens(turn))
+        .sum();
+    if tokens > MAX_EPISODE_TOKENS {
+        return Err(ApiError::TurnsTooLarge);
+    }
+    if tokens_used(&state, &user_id, &utc_day(now_ms()?)).await? >= DAILY_TOKEN_CAP {
+        return Err(ApiError::DailyCap);
+    }
+    let reply = llm::episode(
+        &state.model,
+        &state.config.anthropic_api_url,
+        &state.config.model_id,
+        &request,
+    )
+    .await?;
+    add_tokens(&state, &user_id, &utc_day(now_ms()?), reply.input_tokens).await?;
+    let episode = llm::episode_text(reply.tool_input)?;
+    Ok(Json(EpisodeResponse { episode }))
 }
 
 /// These limits also bound the size of the model input, so it needs no token estimate.

@@ -192,13 +192,14 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
       - Candidate over 2,000 chars → no row.
       - Service unreachable, restart the daemon → turn stays `pending`. Service back → processed.
       - Service replies 429 → turn stays `pending`.
-  - F4. Episodes: `POST /v1/episode`, `SessionTracker`, one episode per session. Docs: tasks. Needs: F3. Status: not started.
+  - F4. Episodes: `POST /v1/episode`, `SessionTracker`, one episode per session. Docs: requirements, design, tasks. Needs: F3. Status: done.
     - Verify (Dev stack for the first case, a stub service for the others):
       - Session with turns, SessionEnd → one project-scoped episode with attempted, worked, failed. Recall probe on a related prompt returns it. Session's queued turns deleted. [approval]
-      - Session with turns, no SessionEnd, 60 min after the last turn (clock set by the test) → one episode.
+      - Session with turns, no SessionEnd, 50 min after the last turn (clock set by the test) → one episode.
       - SessionEnd, then the idle timer passes → still one episode.
-      - Turns over 100k tokens → 413 from the service; turns kept.
-      - Session with no turns → OQ6.
+      - Turns over 100k tokens → one episode from the first turn and the most recent turns that fit.
+      - Session with no turns → no episode, no service call.
+      - Resumed session after its episode → one more episode for the new turns only.
   - F5. Eval: `loremaster dev eval` scores the labeled eval set, thresholds tuned to pass. Docs: tasks. Needs: F4, OQ1. Status: not started.
     - Verify (Dev stack) [approval]:
       - `loremaster dev eval <dir>` on the 20 labeled sessions → report with >= 80% expected stored, <= 20% junk, >= 80% injected relevant, 0 project leaks, 100% contradiction cases with only the newer fact injected.
@@ -304,7 +305,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
 - OQ3. Resolved. M2 F3 design: 401 for a missing, unknown or deleted device token; 404 for another user's device or an unknown device id. M2 F4 design: 404 for a `replace_device_id` that is not one of the user's devices. M3 F1 design: 400 for a push of more than 99 records or a bad record (text over 2,000 chars included).
 - OQ4. Resolved. M2 F2 design: `GITHUB_API_URL` and a local fake GitHub. M4 F1 design: `ANTHROPIC_API_URL` and a local fake Messages API.
 - OQ5. Resolved. M4 F1 design: Anthropic Messages API with a service API key in Secrets Manager (Bedrock Claude quotas are 0 on this account).
-- OQ6. Session with no turns: FR17 says every session produces one episode, and there is nothing to summarize. Owner: /to-brd, by M4 F4.
+- OQ6. Resolved. M4 F4 requirements: a session with no turns makes no episode.
 - OQ7. Uninstall with the service unreachable: FR13 requires the slot freed, and the design does not define this path. Owner: /to-design, by M5 F3.
 - OQ8. Prerequisites. Owner: user.
   - By M2 F2: AWS account, `aws`, `sam`, `cargo-lambda`, DynamoDB Local, GitHub OAuth App. The 3 tools are not on the dev Mac today.

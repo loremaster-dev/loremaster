@@ -93,7 +93,7 @@ Two processes from one Rust binary.
 - `Recall`: profile + per-prompt retrieval.
 - `Pipeline`: extraction worker (Section 3).
 - `SyncClient`: push/pull (Section 4).
-- `SessionTracker`: per-session last-turn time, 60 min idle timer for episodes (FR3).
+- `SessionTracker`: per-session last-turn time, 50 min idle timer for episodes, so the episode reaches other devices within the 60 min of FR3 (M4 F4 design).
 - `ProjectId`: from `cwd`, `remote.origin.url` via `gix`, normalized to `host/owner/repo` (SSH and HTTPS equal). No remote: last path segment. Cached per `cwd`. Same in every agent (FR36).
 
 ### Capture (FR14, FR20, NFR3)
@@ -155,7 +155,7 @@ flowchart TD
 - `reconcile`: candidate + neighbours (id, text) to one decision. SUPERSEDE returns the new fact's text (may combine both facts, max 2,000 chars); device writes it as a new fact and marks the old one `superseded_by` it (FR30). Existing memory text is never edited in place.
 - Scope: `user` or `project`; project facts get the session project ID (FR16).
 - Text over 2,000 chars rejected (FR18).
-- Episode (FR17): on SessionEnd or 60 min idle, `POST /v1/episode` with the session's prepared turns (max 100k tokens) to one project-scoped episode: attempted, worked, failed. Session's queued turns deleted after.
+- Episode (FR17): on SessionEnd or 50 min idle, `POST /v1/episode` with the session's prepared turns (max 100k tokens) to one project-scoped episode: attempted, worked, failed. Session's queued turns deleted after.
 - Post-pull dedup: newly pulled facts with similarity >= 0.95 to a local fact in the same scope: tombstone the larger ULID. Deterministic, so devices converge.
 - Thresholds 0.95 / 0.75 and tau are starting values, tuned on the eval set (FR15, FR25, FR31).
 

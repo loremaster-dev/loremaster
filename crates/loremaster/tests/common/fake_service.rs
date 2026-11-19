@@ -1,5 +1,5 @@
-//! A sync service in memory: per-user `seq`, newer `hlc` wins, pages of a fixed size. Extract and
-//! reconcile find nothing and add unless a reply is scripted. Replies can be scripted to test
+//! A sync service in memory: per-user `seq`, newer `hlc` wins, pages of a fixed size. Extract,
+//! reconcile and episode find nothing and add unless a reply is scripted. Replies can be scripted to test
 //! failures.
 
 use std::collections::{HashMap, VecDeque};
@@ -19,6 +19,7 @@ pub enum Route {
     Pull,
     Extract,
     Reconcile,
+    Episode,
 }
 
 #[derive(Default)]
@@ -39,7 +40,7 @@ struct FakeState {
     fail_after: HashMap<Route, usize>,
     pushes: Vec<Value>,
     pull_cursors: Vec<i64>,
-    /// Extract and reconcile bodies as sent.
+    /// Extract, reconcile and episode bodies as sent.
     bodies: HashMap<Route, Vec<Value>>,
 }
 
@@ -62,6 +63,7 @@ impl FakeService {
             .route("/v1/sync/pull", get(pull))
             .route("/v1/extract", post(extract))
             .route("/v1/reconcile", post(reconcile))
+            .route("/v1/episode", post(episode))
             .with_state(state.clone());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -322,6 +324,20 @@ async fn reconcile(
         &headers,
         body,
         json!({"decision": "add"}),
+    )
+}
+
+async fn episode(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    model_call(
+        &state,
+        Route::Episode,
+        &headers,
+        body,
+        json!({"episode": null}),
     )
 }
 

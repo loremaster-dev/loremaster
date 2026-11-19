@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use loremaster_core::{Candidate, Neighbour, ReconcileRequest, ReconcileResponse};
+use loremaster_core::{Candidate, EpisodeRequest, Neighbour, ReconcileRequest, ReconcileResponse};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -11,12 +11,16 @@ use crate::MAX_TEXT_CHARS;
 
 const EXTRACT_PROMPT: &str = include_str!("../prompts/extract.md");
 const RECONCILE_PROMPT: &str = include_str!("../prompts/reconcile.md");
+const EPISODE_PROMPT: &str = include_str!("../prompts/episode.md");
 const RECORD_CANDIDATES: &str = "record_candidates";
 const RECORD_DECISION: &str = "record_decision";
+const RECORD_EPISODE: &str = "record_episode";
+// Three parts of this length and their labels fit in one memory of 2,000 characters.
+const MAX_EPISODE_PART_CHARS: usize = 600;
 const MAX_CANDIDATES: usize = 3;
 // Room for 3 facts of 2,000 characters each.
 const MAX_OUTPUT_TOKENS: u32 = 4_096;
-// Room for one fact of 2,000 characters.
+// Room for one fact or episode of 2,000 characters.
 const MAX_DECISION_TOKENS: u32 = 1_024;
 const API_VERSION: &str = "2026-10-21";
 // Anthropic's status for "overloaded"; it has no `reqwest::StatusCode` constant.
@@ -167,6 +171,44 @@ pub(crate) async fn reconcile(
     .await
 }
 
+/// Asks Claude what the session attempted, what worked and what failed.
+pub(crate) async fn episode(
+    client: &reqwest::Client,
+    api_url: &str,
+    model_id: &str,
+    request: &EpisodeRequest,
+) -> Result<Reply, LlmError> {
+    let part = |description: &str| json!({"type": "string", "maxLength": MAX_EPISODE_PART_CHARS, "description": description});
+    let tool = Tool {
+        name: RECORD_EPISODE,
+        description: "Records what the session attempted, what worked and what failed.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "task_attempted": {
+                    "type": "boolean",
+                    "description": "False when the session has no task.",
+                },
+                "attempted": part("What the session tried to do."),
+                "worked": part("What worked. Empty if nothing worked."),
+                "failed": part("What failed, and why. Empty if nothing failed."),
+            },
+            "required": ["task_attempted"],
+        }),
+    };
+    let content = serde_json::to_string(request).expect("a request serializes");
+    call_tool(
+        client,
+        api_url,
+        model_id,
+        EPISODE_PROMPT,
+        &tool,
+        MAX_DECISION_TOKENS,
+        &content,
+    )
+    .await
+}
+
 /// One Messages call with `system` as the prompt, `content` as the user message and `tool` as
 /// the forced tool.
 async fn call_tool(
@@ -282,6 +324,130 @@ pub(crate) fn decision(
     Ok(decision)
 }
 
+#[derive(Deserialize)]
+struct EpisodeInput {
+    task_attempted: bool,
+    #[serde(default)]
+    attempted: String,
+    #[serde(default)]
+    worked: String,
+    #[serde(default)]
+    failed: String,
+}
+
+/// The episode text in the tool input, or `None` when the session attempted no task.
+pub(crate) fn episode_text(tool_input: Option<Value>) -> Result<Option<String>, LlmError> {
+    let Some(input) = tool_input else {
+        return Err(LlmError::Failed);
+    };
+    let bad = |input: &Value| {
+        tracing::error!(%input, "Claude recorded a bad episode");
+        LlmError::Failed
+    };
+    let episode: EpisodeInput = serde_json::from_value(input.clone()).map_err(|_| bad(&input))?;
+    if !episode.task_attempted {
+        return Ok(None);
+    }
+    let attempted = episode.attempted.trim();
+    if attempted.is_empty() {
+        return Err(bad(&input));
+    }
+    let or_none = |part: &str| match part.trim() {
+        "" => "none".to_owned(),
+        part => part.to_owned(),
+    };
+    let text = format!(
+        "Attempted: {attempted}\nWorked: {}\nFailed: {}",
+        or_none(&episode.worked),
+        or_none(&episode.failed)
+    );
+    if !valid_text(&text) {
+        return Err(bad(&input));
+    }
+    Ok(Some(text))
+}
+
 pub(crate) fn valid_text(text: &str) -> bool {
     (1..=MAX_TEXT_CHARS).contains(&text.trim().chars().count())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(input: Value) -> Option<String> {
+        episode_text(Some(input)).unwrap()
+    }
+
+    fn refused(input: Option<Value>) -> bool {
+        matches!(episode_text(input), Err(LlmError::Failed))
+    }
+
+    #[test]
+    fn an_episode_joins_the_three_parts_trimmed() {
+        let input = json!({
+            "task_attempted": true,
+            "attempted": " Fix the flaky sync test\n",
+            "worked": "Waiting for the pull",
+            "failed": "\tA longer timeout ",
+        });
+        assert_eq!(
+            text(input).as_deref(),
+            Some(
+                "Attempted: Fix the flaky sync test\nWorked: Waiting for the pull\n\
+                 Failed: A longer timeout"
+            )
+        );
+    }
+
+    #[test]
+    fn an_empty_or_missing_worked_or_failed_is_none() {
+        let cases = [
+            json!({"task_attempted": true, "attempted": "Fix it", "worked": "", "failed": " \n"}),
+            json!({"task_attempted": true, "attempted": "Fix it"}),
+        ];
+        for input in cases {
+            assert_eq!(
+                text(input).as_deref(),
+                Some("Attempted: Fix it\nWorked: none\nFailed: none")
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_with_no_task_has_no_episode() {
+        assert_eq!(text(json!({"task_attempted": false})), None);
+        assert_eq!(
+            text(json!({"task_attempted": false, "attempted": "Said hi", "worked": "x"})),
+            None
+        );
+    }
+
+    #[test]
+    fn bad_tool_inputs_are_refused() {
+        let bad = [
+            None,
+            Some(json!({"attempted": "Fix it"})),
+            Some(json!({"task_attempted": "yes", "attempted": "Fix it"})),
+            Some(json!({"task_attempted": true})),
+            Some(json!({"task_attempted": true, "attempted": " \n\t "})),
+            Some(json!({"task_attempted": true, "attempted": 3})),
+            Some(json!({"task_attempted": true, "attempted": "Fix it", "worked": null})),
+            Some(json!("not an object")),
+        ];
+        for input in bad {
+            assert!(refused(input.clone()), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn an_episode_is_at_most_2_000_characters() {
+        let labels = "Attempted: \nWorked: \nFailed: none".chars().count();
+        let fits = MAX_TEXT_CHARS - labels;
+        let worked = "é".repeat(fits - 1_000);
+        let input = |attempted: usize| json!({"task_attempted": true, "attempted": "a".repeat(attempted), "worked": worked});
+        let longest = text(input(1_000)).unwrap();
+        assert_eq!(longest.chars().count(), MAX_TEXT_CHARS);
+        assert!(refused(Some(input(1_001))));
+    }
 }

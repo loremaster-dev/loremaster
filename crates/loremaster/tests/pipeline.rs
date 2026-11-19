@@ -3,6 +3,8 @@
 mod common;
 
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
 use common::fake_service::{FakeService, Route};
@@ -10,9 +12,10 @@ use common::{
     Sandbox, embedder, hook_input, memory, request, save_credential, set_api_url, wait_for,
 };
 use loremaster::now_ms;
-use loremaster::pipeline::{Pause, Pipeline, Step};
+use loremaster::pipeline::{Cadence, Pause, Pipeline, Step};
 use loremaster::recall::Recall;
 use loremaster::store::{QueuedTurn, StoredMemory};
+use loremaster::sync::{self, SyncClient};
 use loremaster_core::{DeviceCredential, Kind, Record, RecordType, Scope};
 use serde_json::{Value, json};
 
@@ -453,11 +456,11 @@ fn a_turn_the_service_can_never_take_is_given_up_at_once() {
 }
 
 #[test]
-fn a_retried_turn_does_not_store_a_fact_twice() {
+fn a_turn_that_fails_part_way_writes_nothing_until_its_retry() {
     let fake = FakeService::start(100);
-    let mut home = Home::new(&fake, &[]);
+    let mut home = Home::new(&fake, &[stored_fact(PNPM, None)]);
     home.queue(WEB, "{}");
-    let candidates = [candidate(PNPM, "user"), candidate(YARN, "user")];
+    let candidates = [candidate(TABS, "user"), candidate(YARN, "user")];
     script_extract(&fake, &candidates);
     fake.script(
         Route::Reconcile,
@@ -475,10 +478,12 @@ fn a_retried_turn_does_not_store_a_fact_twice() {
         texts
     };
     assert_eq!(texts(&home), [PNPM]);
+    assert!(home.outbox().is_empty());
 
     script_extract(&fake, &candidates);
     assert_eq!(home.pipeline.process_next().unwrap(), Step::Handled);
-    assert_eq!(texts(&home), [PNPM, YARN]);
+    assert_eq!(texts(&home), [TABS, PNPM, YARN]);
+    assert_eq!(home.outbox().len(), 2);
     assert_eq!(home.statuses(), [("extracted".to_owned(), 0)]);
 }
 
@@ -574,4 +579,398 @@ fn a_captured_turn_wakes_an_idle_pipeline() {
     // The queue is empty now, so only a wake from the capture starts the pipeline again soon.
     assert_eq!(sandbox.ask(&stop), "{}");
     wait_for(|| count(&sandbox, "extracted") == 4, "the captured turns");
+}
+
+#[test]
+fn a_wake_does_not_end_the_pause_after_the_daily_cap() {
+    let fake = FakeService::start(100);
+    let home = Home::new(&fake, &[]);
+    home.queue(WEB, "{}");
+    fake.script(
+        Route::Extract,
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({"error": "daily token limit reached"}),
+    );
+    let long = Duration::from_secs(600);
+    let sync =
+        SyncClient::new(home.recall.clone(), home.sandbox.paths.clone()).spawn(sync::Cadence {
+            outbox_check: long,
+            period: long,
+            retry: long,
+        });
+    let daily_cap = Duration::from_secs(2);
+    let pipeline = home.pipeline.spawn(
+        Cadence {
+            not_ready: Duration::from_millis(10),
+            retry: long,
+            daily_cap,
+            idle: long,
+            episode_idle: long,
+        },
+        sync.triggers(),
+    );
+    wait_for(|| fake.requests(Route::Extract) == 1, "the first extract");
+    let refused = Instant::now();
+    for _ in 0..5 {
+        pipeline.wake().wake();
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(fake.requests(Route::Extract), 1);
+    wait_for(
+        || fake.requests(Route::Extract) == 2,
+        "the extract after the pause",
+    );
+    assert!(refused.elapsed() >= daily_cap - Duration::from_millis(50));
+    pipeline.stop().unwrap();
+    sync.stop().unwrap();
+}
+
+const EPISODE: &str = "Attempted: move the build to pnpm\nWorked: pnpm install\nFailed: none";
+const MINUTE_MS: i64 = 60_000;
+
+impl Home {
+    /// Queues a prepared turn of `session` in the web project, made at `at_ms`.
+    fn queue_in(&self, session: &str, turn: &str, at_ms: i64) {
+        let store = self.sandbox.store();
+        store.upsert_session(session, AGENT, WEB, None).unwrap();
+        store
+            .commit_turn(QueuedTurn {
+                session_id: session,
+                agent: AGENT,
+                project_id: WEB,
+                turn,
+                next_offset: 0,
+                now_ms: at_ms,
+            })
+            .unwrap();
+    }
+
+    fn end(&self, session: &str) {
+        self.sandbox.store().end_session(session).unwrap();
+    }
+
+    /// Runs the pipeline until it waits, and returns why it waits.
+    fn drain(&mut self) -> Step {
+        for _ in 0..20 {
+            let step = self.pipeline.process_next().unwrap();
+            if step != Step::Handled {
+                return step;
+            }
+        }
+        panic!("the pipeline never waited");
+    }
+
+    fn episodes(&self) -> Vec<Record> {
+        self.facts()
+            .into_iter()
+            .filter(|r| r.record_type == Some(RecordType::Episode))
+            .collect()
+    }
+
+    fn queued(&self) -> Vec<String> {
+        let conn = rusqlite::Connection::open(self.sandbox.paths.store_db()).unwrap();
+        conn.prepare("SELECT turn FROM turn_queue ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn episode_attempts(&self, session: &str) -> i64 {
+        let conn = rusqlite::Connection::open(self.sandbox.paths.store_db()).unwrap();
+        conn.query_row(
+            "SELECT episode_attempts FROM sessions WHERE session_id = ?1",
+            [session],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+}
+
+fn script_episode(fake: &FakeService, episode: Option<&str>) {
+    fake.script(
+        Route::Episode,
+        StatusCode::OK,
+        json!({ "episode": episode }),
+    );
+}
+
+#[test]
+fn an_ended_session_gets_one_project_episode_and_its_turns_go() {
+    let fake = FakeService::start(100);
+    let mut home = Home::new(&fake, &[]);
+    home.queue_in("s1", "turn one", now_ms());
+    home.queue_in("s1", "turn two", now_ms());
+    home.end("s1");
+    script_episode(&fake, Some(EPISODE));
+    assert_eq!(home.drain(), Step::Idle);
+
+    assert_eq!(
+        fake.bodies(Route::Episode),
+        [json!({"turns": ["turn one", "turn two"]})]
+    );
+    let episodes = home.episodes();
+    assert_eq!(episodes.len(), 1);
+    let episode = &episodes[0];
+    assert_eq!(episode.text.as_deref(), Some(EPISODE));
+    assert_eq!(episode.scope, Some(Scope::Project));
+    assert_eq!(episode.project_id.as_deref(), Some(WEB));
+    assert_eq!(episode.kind, None);
+    assert_eq!(episode.writer, home.device.device_id);
+    assert_eq!(home.outbox(), [episode.memory_id.as_str()]);
+    assert!(home.queued().is_empty());
+
+    let recalled = home
+        .recall
+        .for_prompt(
+            "s2",
+            WEB,
+            "how did the move of the build to pnpm go?",
+            now_ms(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(recalled.memory_ids, [episode.memory_id.as_str()]);
+
+    // Its turns are gone, so the idle time passing later makes no second episode.
+    assert_eq!(home.drain(), Step::Idle);
+    assert_eq!(fake.requests(Route::Episode), 1);
+}
+
+#[test]
+fn a_session_with_no_turns_gets_no_episode() {
+    let fake = FakeService::start(100);
+    let mut home = Home::new(&fake, &[]);
+    let store = home.sandbox.store();
+    store.upsert_session("s1", AGENT, WEB, None).unwrap();
+    store.end_session("s1").unwrap();
+    drop(store);
+    assert_eq!(home.drain(), Step::Idle);
+    assert_eq!(fake.requests(Route::Episode), 0);
+}
+
+#[test]
+fn a_session_with_no_task_gets_no_episode_and_its_turns_go() {
+    let fake = FakeService::start(100);
+    let mut home = Home::new(&fake, &[]);
+    home.queue_in("s1", "hello", now_ms());
+    home.end("s1");
+    script_episode(&fake, None);
+    assert_eq!(home.drain(), Step::Idle);
+    assert_eq!(fake.requests(Route::Episode), 1);
+    assert!(home.episodes().is_empty());
+    assert!(home.outbox().is_empty());
+    assert!(home.queued().is_empty());
+}
+
+#[test]
+fn turns_over_the_limit_send_the_first_and_the_newest_that_fit() {
+    let fake = FakeService::start(100);
+    let mut home = Home::new(&fake, &[]);
+    // 30,000 estimated tokens each: the first turn and three of these fit under 100,000.
+    let big: Vec<String> = (0..4)
+        .map(|n| format!("{n}{}", "x".repeat(89_999)))
+        .collect();
+    home.queue_in("s1", "first", now_ms());
+    for turn in &big {
+        home.queue_in("s1", turn, now_ms());
+    }
+    home.end("s1");
+    script_episode(&fake, Some(EPISODE));
+    assert_eq!(home.drain(), Step::Idle);
+    assert_eq!(
+        fake.bodies(Route::Episode),
+        [json!({"turns": ["first", big[1], big[2], big[3]]})]
+    );
+    assert_eq!(home.episodes().len(), 1);
+    assert!(home.queued().is_empty());
+}
+
+#[test]
+fn an_open_session_gets_its_episode_once_it_has_been_idle_long_enough() {
+    let fake = FakeService::start(100);
+    let mut home = Home::new(&fake, &[]);
+    let now = now_ms();
+    home.queue_in("idle", "idle turn", now - 50 * MINUTE_MS - 1_000);
+    home.queue_in("active", "active turn", now - 49 * MINUTE_MS);
+    script_episode(&fake, Some(EPISODE));
+    assert_eq!(home.drain(), Step::Idle);
+    assert_eq!(
+        fake.bodies(Route::Episode),
+        [json!({"turns": ["idle turn"]})]
+    );
+    assert_eq!(home.queued(), ["active turn"]);
+}
+
+#[test]
+fn a_resumed_session_gets_a_second_episode_for_its_new_turns_only() {
+    let fake = FakeService::start(100);
+    let mut home = Home::new(&fake, &[]);
+    home.queue_in("s1", "before", now_ms());
+    home.end("s1");
+    script_episode(&fake, Some(EPISODE));
+    assert_eq!(home.drain(), Step::Idle);
+
+    home.queue_in("s1", "after", now_ms());
+    assert_eq!(home.drain(), Step::Idle);
+    assert_eq!(fake.requests(Route::Episode), 1);
+    home.end("s1");
+    script_episode(
+        &fake,
+        Some("Attempted: a lint fix\nWorked: none\nFailed: none"),
+    );
+    assert_eq!(home.drain(), Step::Idle);
+    assert_eq!(fake.bodies(Route::Episode)[1], json!({"turns": ["after"]}));
+    assert_eq!(home.episodes().len(), 2);
+}
+
+#[test]
+fn a_turn_still_pending_holds_its_session_episode_back() {
+    let fake = FakeService::start(100);
+    let mut home = Home::new(&fake, &[]);
+    home.queue_in("s1", "turn", now_ms());
+    home.end("s1");
+    fake.script(
+        Route::Extract,
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({"error": "busy"}),
+    );
+    assert_eq!(home.drain(), Step::Retry(Pause::Unavailable));
+    assert_eq!(fake.requests(Route::Episode), 0);
+    assert_eq!(home.queued(), ["turn"]);
+}
+
+#[test]
+fn an_episode_that_keeps_failing_is_given_up_after_three_tries() {
+    let fake = FakeService::start(100);
+    let mut home = Home::new(&fake, &[]);
+    home.queue_in("s1", "turn", now_ms());
+    home.end("s1");
+    let too_long = "x".repeat(2_001);
+    fake.script(
+        Route::Episode,
+        StatusCode::BAD_GATEWAY,
+        json!({"error": "bad reply"}),
+    );
+    fake.script(Route::Episode, StatusCode::OK, json!({"episode": too_long}));
+    assert_eq!(home.drain(), Step::Retry(Pause::Unavailable));
+    assert_eq!(home.episode_attempts("s1"), 1);
+    assert_eq!(home.drain(), Step::Retry(Pause::Unavailable));
+    assert_eq!(home.episode_attempts("s1"), 2);
+    fake.script(Route::Episode, StatusCode::INTERNAL_SERVER_ERROR, json!({}));
+    assert_eq!(home.drain(), Step::Idle);
+    assert_eq!(fake.requests(Route::Episode), 3);
+    assert!(home.episodes().is_empty());
+    assert!(home.queued().is_empty());
+    assert_eq!(home.episode_attempts("s1"), 0);
+}
+
+#[test]
+fn an_episode_the_service_can_never_make_is_given_up_at_once() {
+    for status in [StatusCode::BAD_REQUEST, StatusCode::PAYLOAD_TOO_LARGE] {
+        let fake = FakeService::start(100);
+        let mut home = Home::new(&fake, &[]);
+        home.queue_in("s1", "turn", now_ms());
+        home.end("s1");
+        fake.script(Route::Episode, status, json!({"error": "refused"}));
+        assert_eq!(home.drain(), Step::Idle, "{status}");
+        assert_eq!(fake.requests(Route::Episode), 1);
+        assert!(home.episodes().is_empty());
+        assert!(home.queued().is_empty());
+    }
+}
+
+#[test]
+fn an_episode_the_service_cannot_answer_now_keeps_the_turns_uncounted() {
+    let cases = [
+        (StatusCode::SERVICE_UNAVAILABLE, Pause::Unavailable),
+        (StatusCode::TOO_MANY_REQUESTS, Pause::DailyCap),
+        (StatusCode::UNAUTHORIZED, Pause::Login),
+    ];
+    for (status, pause) in cases {
+        let fake = FakeService::start(100);
+        let mut home = Home::new(&fake, &[]);
+        home.queue_in("s1", "turn", now_ms());
+        home.end("s1");
+        fake.script(Route::Episode, status, json!({"error": "not now"}));
+        assert_eq!(home.drain(), Step::Retry(pause), "{status}");
+        assert_eq!(home.queued(), ["turn"]);
+        assert_eq!(home.episode_attempts("s1"), 0);
+    }
+}
+
+#[test]
+fn an_idle_pipeline_wakes_when_an_episode_is_due() {
+    let fake = FakeService::start(100);
+    let home = Home::new(&fake, &[]);
+    home.queue_in("s1", "turn", now_ms());
+    script_episode(&fake, Some(EPISODE));
+    let long = Duration::from_secs(600);
+    let sync =
+        SyncClient::new(home.recall.clone(), home.sandbox.paths.clone()).spawn(sync::Cadence {
+            outbox_check: long,
+            period: long,
+            retry: long,
+        });
+    let pipeline = home.pipeline.spawn(
+        Cadence {
+            not_ready: Duration::from_millis(10),
+            retry: long,
+            daily_cap: long,
+            idle: long,
+            episode_idle: Duration::from_secs(1),
+        },
+        sync.triggers(),
+    );
+    wait_for(|| fake.requests(Route::Episode) == 1, "the episode");
+    pipeline.stop().unwrap();
+    sync.stop().unwrap();
+}
+
+#[test]
+fn an_episode_due_when_the_service_was_down_is_made_after_a_restart() {
+    let fake = FakeService::start(100);
+    let (sandbox, stop) = daemon_home(&fake);
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    set_api_url(
+        &sandbox,
+        &format!("http://{}", closed.local_addr().unwrap()),
+    );
+    drop(closed);
+    let dir = sandbox.dir.path().join("agent");
+    let session_end = request(
+        "session_end",
+        AGENT,
+        &hook_input(AGENT, "session_end.json", &dir, None),
+    );
+
+    let daemon = sandbox.start_daemon();
+    sandbox.wait_for_embedder();
+    assert_eq!(sandbox.ask(&stop), "{}");
+    assert_eq!(sandbox.ask(&session_end), "{}");
+    wait_for(|| sandbox.turns().len() == 3, "three queued turns");
+    assert!(daemon.terminate().success());
+
+    set_api_url(&sandbox, &fake.url);
+    script_episode(&fake, Some(EPISODE));
+    let _daemon = sandbox.start_daemon();
+    wait_for(
+        || {
+            fake.records(USER).iter().any(|record| {
+                record.record_type == Some(RecordType::Episode)
+                    && record.text.as_deref() == Some(EPISODE)
+                    && record.project_id.is_some()
+            })
+        },
+        "the episode pushed",
+    );
+    assert_eq!(
+        fake.bodies(Route::Episode)[0]["turns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    wait_for(|| sandbox.turns().is_empty(), "the turns deleted");
 }

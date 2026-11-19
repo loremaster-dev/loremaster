@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use loremaster_core::{
-    Candidate, DeviceCredential, ExtractRequest, ExtractResponse, ReconcileRequest,
-    ReconcileResponse,
+    Candidate, DeviceCredential, EpisodeRequest, EpisodeResponse, ExtractRequest, ExtractResponse,
+    ReconcileRequest, ReconcileResponse, estimate_tokens,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -17,8 +17,8 @@ use thiserror::Error;
 
 use crate::config::{self, ConfigError, Paths};
 use crate::index::DUPLICATE_SIMILARITY;
-use crate::recall::{Recall, RecallError};
-use crate::store::{PendingTurn, StoreError, TurnStatus};
+use crate::recall::{Recall, RecallError, TurnFacts};
+use crate::store::{DueEpisode, PendingTurn, StoreError, TurnStatus};
 use crate::sync::Triggers;
 
 /// Above the service's own limit on a model call.
@@ -28,6 +28,10 @@ const NEW_FACT_SIMILARITY: f32 = 0.75;
 const MAX_FACT_CHARS: usize = 2_000;
 /// Failed tries of one turn before it is given up. Only failures that the turn can cause count.
 const MAX_ATTEMPTS: i64 = 5;
+/// Failed tries of one session's episode before it is given up.
+const MAX_EPISODE_ATTEMPTS: i64 = 3;
+/// The most turn text, in estimated tokens, that one episode is made from.
+const MAX_EPISODE_TOKENS: usize = 100_000;
 /// A turn starts only once the model has loaded, and a loaded model stays.
 const MODEL_LOADED: &str = "the embedding model is loaded";
 
@@ -42,6 +46,8 @@ pub struct Cadence {
     pub daily_cap: Duration,
     /// With no turn waiting. A captured turn wakes the thread sooner.
     pub idle: Duration,
+    /// With no turn for this long, a session that did not report its end gets its episode.
+    pub episode_idle: Duration,
 }
 
 impl Cadence {
@@ -50,6 +56,8 @@ impl Cadence {
         retry: Duration::from_secs(30),
         daily_cap: Duration::from_secs(60 * 60),
         idle: Duration::from_secs(5 * 60),
+        // Under an hour, so the episode reaches other devices within an hour of the last turn.
+        episode_idle: Duration::from_secs(50 * 60),
     };
 
     fn after(&self, step: Step) -> Duration {
@@ -66,9 +74,9 @@ impl Cadence {
 /// What one call of `Pipeline::process_next` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
-    /// A turn was extracted, or given up as one that can never be.
+    /// A turn was extracted or a session's episode made, or one was given up as never possible.
     Handled,
-    /// No turn is waiting.
+    /// No turn or episode is waiting.
     Idle,
     /// The turn stays queued until the pause ends.
     Retry(Pause),
@@ -132,6 +140,7 @@ pub struct Pipeline {
     agent: ureq::Agent,
     /// A token the service refused. It is not sent again until login saves another.
     refused_token: Option<String>,
+    episode_idle: Duration,
     stop: Arc<AtomicBool>,
 }
 
@@ -147,13 +156,15 @@ impl Pipeline {
             paths,
             agent,
             refused_token: None,
+            episode_idle: Cadence::DAEMON.episode_idle,
             stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Runs on its own thread until stopped: at start, on each wake, and on `cadence`. Asks
     /// `sync` to push after each turn it handles.
-    pub fn spawn(self, cadence: Cadence, sync: Triggers) -> PipelineHandle {
+    pub fn spawn(mut self, cadence: Cadence, sync: Triggers) -> PipelineHandle {
+        self.episode_idle = cadence.episode_idle;
         let (sender, messages) = mpsc::channel();
         let stop = self.stop.clone();
         let thread = thread::spawn(move || self.run(cadence, &messages, &sync));
@@ -167,13 +178,19 @@ impl Pipeline {
     fn run(mut self, cadence: Cadence, messages: &Receiver<Message>, sync: &Triggers) {
         let mut reported = None;
         while !self.stopping() {
-            let wait = match self.process_next() {
+            let (wait, wake_ends_wait) = match self.process_next() {
                 Ok(step) => {
                     reported = None;
                     if step == Step::Handled {
                         sync.push();
                     }
-                    cadence.after(step)
+                    // A new turn cannot make the service answer sooner.
+                    let paused = matches!(step, Step::Retry(Pause::Unavailable | Pause::DailyCap));
+                    let wait = match step {
+                        Step::Idle => self.idle_wait(cadence.idle),
+                        _ => cadence.after(step),
+                    };
+                    (wait, !paused)
                 }
                 Err(error) => {
                     let message = error.to_string();
@@ -181,24 +198,44 @@ impl Pipeline {
                         tracing::error!(error = %message, "cannot extract turns");
                         reported = Some(message);
                     }
-                    cadence.retry
+                    (cadence.retry, true)
                 }
             };
-            if wait.is_zero() {
-                continue;
-            }
-            match messages.recv_timeout(wait) {
-                Ok(Message::Wake) | Err(RecvTimeoutError::Timeout) => {}
-                Ok(Message::Stop) | Err(RecvTimeoutError::Disconnected) => return,
+            let until = Instant::now() + wait;
+            loop {
+                match messages.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                    Ok(Message::Wake) if !wake_ends_wait => {}
+                    Ok(Message::Wake) | Err(RecvTimeoutError::Timeout) => break,
+                    Ok(Message::Stop) | Err(RecvTimeoutError::Disconnected) => return,
+                }
             }
         }
+    }
+
+    /// Up to `idle`, and no later than the next session's episode is due.
+    fn idle_wait(&self, idle: Duration) -> Duration {
+        match self.recall.store().next_episode_at(self.idle_ms()) {
+            Ok(Some(due_at)) => idle.min(Duration::from_millis(
+                due_at.saturating_sub(crate::now_ms()).max(0) as u64,
+            )),
+            Ok(None) => idle,
+            Err(error) => {
+                tracing::error!(%error, "cannot read when an episode is due");
+                idle
+            }
+        }
+    }
+
+    fn idle_ms(&self) -> i64 {
+        self.episode_idle.as_millis() as i64
     }
 
     fn stopping(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
     }
 
-    /// Extracts the oldest pending turn, if the device is ready to.
+    /// Extracts the oldest pending turn, or else makes the episode of a session that has ended,
+    /// if the device is ready to.
     pub fn process_next(&mut self) -> Result<Step, PipelineError> {
         let Some(target) = self.target()? else {
             return Ok(Step::Retry(Pause::NotReady));
@@ -210,20 +247,17 @@ impl Pipeline {
             return Ok(Step::Retry(Pause::NotReady));
         }
         let Some(turn) = self.recall.store().next_pending_turn()? else {
-            return Ok(Step::Idle);
+            return self.next_episode(&target);
         };
         match self.extract(&target, &turn) {
-            Ok(()) => {
-                self.recall
-                    .store()
-                    .set_turn_status(turn.id, TurnStatus::Extracted)?;
-                Ok(Step::Handled)
-            }
+            Ok(()) => Ok(Step::Handled),
             Err(TurnError::Local(error)) => Err(error),
             Err(TurnError::Call(error)) => self.after_failure(&turn, error),
         }
     }
 
+    /// Decides every candidate of the turn, then writes them all at once, so a call that fails
+    /// part way writes nothing and the retry starts from the same state.
     fn extract(&mut self, target: &Target, turn: &PendingTurn) -> Result<(), TurnError> {
         let reply: ExtractResponse = self
             .call(
@@ -234,6 +268,7 @@ impl Pipeline {
                 },
             )
             .map_err(TurnError::Call)?;
+        let mut facts = TurnFacts::default();
         for candidate in reply.candidates {
             let text = candidate.text.trim();
             if !(1..=MAX_FACT_CHARS).contains(&text.chars().count()) {
@@ -247,8 +282,10 @@ impl Pipeline {
                 text: text.to_owned(),
                 ..candidate
             };
-            self.resolve(target, turn, &candidate)?;
+            self.resolve(target, turn, &candidate, &mut facts)?;
         }
+        self.recall
+            .finish_turn(turn.id, facts, &target.credential.device_id)?;
         Ok(())
     }
 
@@ -258,6 +295,7 @@ impl Pipeline {
         target: &Target,
         turn: &PendingTurn,
         candidate: &Candidate,
+        facts: &mut TurnFacts,
     ) -> Result<(), TurnError> {
         let found = self
             .recall
@@ -294,14 +332,102 @@ impl Pipeline {
             }
             None => (None, candidate.clone(), found.vector),
         };
-        self.recall.write_fact(
+        self.recall.add_fact(
+            facts,
             &candidate,
             &turn.project_id,
             vector,
             supersedes.as_deref(),
-            &target.credential.device_id,
         )?;
         Ok(())
+    }
+
+    fn next_episode(&mut self, target: &Target) -> Result<Step, PipelineError> {
+        let due = self
+            .recall
+            .store()
+            .due_episode(crate::now_ms(), self.idle_ms())?;
+        let Some(due) = due else {
+            return Ok(Step::Idle);
+        };
+        match self.episode(target, &due) {
+            Ok(()) => Ok(Step::Handled),
+            Err(TurnError::Local(error)) => Err(error),
+            Err(TurnError::Call(error)) => self.after_episode_failure(target, &due, error),
+        }
+    }
+
+    /// Asks the service to sum up the session, then stores the episode, if there is one, and
+    /// deletes the session's queued turns.
+    fn episode(&mut self, target: &Target, due: &DueEpisode) -> Result<(), TurnError> {
+        let request = EpisodeRequest {
+            turns: episode_turns(&due.turns),
+        };
+        let reply: EpisodeResponse = self
+            .call(target, "/v1/episode", &request)
+            .map_err(TurnError::Call)?;
+        let turn_ids: Vec<i64> = due.turns.iter().map(|(id, _)| *id).collect();
+        let writer = &target.credential.device_id;
+        let Some(text) = reply.episode else {
+            self.recall.store().finish_episode(
+                &due.session_id,
+                &turn_ids,
+                None,
+                writer,
+                crate::now_ms(),
+            )?;
+            return Ok(());
+        };
+        let text = text.trim();
+        if !(1..=MAX_FACT_CHARS).contains(&text.chars().count()) {
+            return Err(TurnError::Call(CallError::Failed(format!(
+                "episode of {} characters",
+                text.chars().count()
+            ))));
+        }
+        let vector = self.recall.embed(text)?.expect(MODEL_LOADED);
+        self.recall.write_episode(
+            text,
+            vector,
+            &due.project_id,
+            &due.session_id,
+            &turn_ids,
+            writer,
+        )?;
+        Ok(())
+    }
+
+    /// Keeps the session's turns for a retry, or gives its episode up when they are the cause.
+    fn after_episode_failure(
+        &self,
+        target: &Target,
+        due: &DueEpisode,
+        error: CallError,
+    ) -> Result<Step, PipelineError> {
+        let reason = match error {
+            CallError::Unavailable => return Ok(Step::Retry(Pause::Unavailable)),
+            CallError::DailyCap => return Ok(Step::Retry(Pause::DailyCap)),
+            CallError::Unauthorized => return Ok(Step::Retry(Pause::Login)),
+            CallError::Refused(reason) => reason,
+            CallError::Failed(reason) => {
+                let attempts = self.recall.store().count_episode_failure(&due.session_id)?;
+                if attempts < MAX_EPISODE_ATTEMPTS {
+                    tracing::warn!(session = %due.session_id, attempts, %reason, "episode failed");
+                    return Ok(Step::Retry(Pause::Unavailable));
+                }
+                reason
+            }
+        };
+        tracing::error!(session = %due.session_id, %reason, "giving up an episode");
+        let turn_ids: Vec<i64> = due.turns.iter().map(|(id, _)| *id).collect();
+        self.recall.store().finish_episode(
+            &due.session_id,
+            &turn_ids,
+            None,
+            &target.credential.device_id,
+            crate::now_ms(),
+        )?;
+        Ok(Step::Handled)
     }
 
     /// Keeps the turn for a retry, or gives it up when it is the cause.
@@ -394,6 +520,28 @@ impl Pipeline {
     }
 }
 
+/// The turns an episode is made from: the first, which usually states the task, then as many of
+/// the newest as fit, oldest first.
+fn episode_turns(turns: &[(i64, String)]) -> Vec<String> {
+    let ((_, first), rest) = turns
+        .split_first()
+        .expect("a session is due only with a queued turn");
+    let mut used = estimate_tokens(first);
+    let newest = rest
+        .iter()
+        .rev()
+        .map(|(_, turn)| turn)
+        .take_while(|turn| {
+            used += estimate_tokens(turn);
+            used <= MAX_EPISODE_TOKENS
+        })
+        .count();
+    std::iter::once(first)
+        .chain(rest[rest.len() - newest..].iter().map(|(_, turn)| turn))
+        .cloned()
+        .collect()
+}
+
 enum Message {
     Wake,
     Stop,
@@ -441,6 +589,7 @@ mod tests {
             retry: Duration::from_secs(2),
             daily_cap: Duration::from_secs(3),
             idle: Duration::from_secs(4),
+            episode_idle: Duration::from_secs(5),
         };
         let cases = [
             (Step::Handled, 0),
