@@ -4,18 +4,20 @@ mod common;
 
 use std::fs;
 use std::net::TcpListener;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::StatusCode;
 use common::fake_service::{FakeService, Route};
 use common::{
-    DeliveredRecall, Sandbox, embedder, memory, request, save_credential, set_api_url, wait_for,
+    DeliveredRecall, Sandbox, acme_web_repo, embedder, fixture_dir, hook_input, memory, request,
+    save_credential, set_api_url, wait_for,
 };
 use loremaster::embed::MODEL_ID;
 use loremaster::now_ms;
 use loremaster::recall::Recall;
-use loremaster::store::StoredMemory;
+use loremaster::store::{QueuedTurn, StoredMemory};
 use loremaster::sync::{Cadence, SyncClient, SyncError};
 use loremaster_core::{DeviceCredential, Kind, Record, RecordType, Scope, new_ulid};
 use serde_json::json;
@@ -502,8 +504,12 @@ fn stop_does_not_wait_for_queued_pulls() {
 }
 
 fn user_prompt(sandbox: &Sandbox, text: &str) -> String {
+    user_prompt_in(sandbox, sandbox.dir.path(), text)
+}
+
+fn user_prompt_in(sandbox: &Sandbox, cwd: &Path, text: &str) -> String {
     let event = json!({
-        "session_id": "s1", "cwd": sandbox.dir.path(), "prompt": text,
+        "session_id": "s1", "cwd": cwd, "prompt": text,
         "hook_event_name": "UserPromptSubmit",
     })
     .to_string();
@@ -1123,4 +1129,175 @@ fn the_same_fact_from_two_devices_ends_as_one_on_both() {
     assert_eq!(on_service.len(), 2);
     assert!(on_service.contains(&(smaller, false)));
     assert!(on_service.contains(&(larger, true)));
+}
+
+const PNPM: &str = "Prefers pnpm over npm";
+const EPISODE: &str = "Attempted: move the build to pnpm\nWorked: pnpm install\nFailed: none";
+const WEB: &str = "github.com/acme/web";
+
+/// Two homes of one user, each with a checkout of the same repo. A also has an agent transcript.
+struct TwoHomes {
+    a: Sandbox,
+    b: Sandbox,
+    a_repo: PathBuf,
+    b_repo: PathBuf,
+}
+
+impl TwoHomes {
+    fn new(fake: &FakeService) -> Self {
+        let (a, _) = home(fake, Sandbox::with_model());
+        let (b, _) = home(fake, Sandbox::with_model());
+        let a_repo = acme_web_repo(a.dir.path());
+        let b_repo = acme_web_repo(b.dir.path());
+        let agent = a.dir.path().join("agent");
+        fs::create_dir_all(&agent).unwrap();
+        fs::copy(
+            fixture_dir("claude-code").join("transcript.jsonl"),
+            agent.join("transcript.jsonl"),
+        )
+        .unwrap();
+        Self {
+            a,
+            b,
+            a_repo,
+            b_repo,
+        }
+    }
+
+    /// Sends a hook event of A's agent session, in A's checkout.
+    fn on_a(&self, verb: &str, file: &str) {
+        let agent = self.a.dir.path().join("agent");
+        let event = hook_input("claude-code", file, &agent, Some(&self.a_repo));
+        assert_eq!(self.a.ask(&request(verb, "claude-code", &event)), "{}");
+    }
+
+    /// Pulls on B, then waits until B can recall the pushed record with `text`.
+    fn pull_on_b(&self, fake: &FakeService, text: &str) {
+        let id = fake
+            .records(USER)
+            .into_iter()
+            .find(|record| record.text.as_deref() == Some(text))
+            .expect("the record pushed")
+            .memory_id;
+        session_start(&self.b);
+        wait_for(
+            || {
+                self.b
+                    .store()
+                    .get_memory(&id)
+                    .unwrap()
+                    .is_some_and(|m| m.vector.is_some())
+            },
+            "pull on B",
+        );
+    }
+}
+
+fn pushed_episode(fake: &FakeService) -> Option<Record> {
+    fake.records(USER)
+        .into_iter()
+        .find(|record| record.record_type == Some(RecordType::Episode))
+}
+
+#[test]
+fn a_fact_extracted_on_one_home_is_recalled_on_another() {
+    let fake = FakeService::start(100);
+    let homes = TwoHomes::new(&fake);
+    fake.script(
+        Route::Extract,
+        StatusCode::OK,
+        json!({"candidates": [{"text": PNPM, "scope": "user", "kind": "preference"}]}),
+    );
+    let _a_daemon = homes.a.start_daemon();
+    let _b_daemon = homes.b.start_daemon();
+    homes.b.wait_for_embedder();
+
+    homes.on_a("capture", "stop.json");
+    wait_for(
+        || {
+            fake.records(USER)
+                .iter()
+                .any(|record| record.text.as_deref() == Some(PNPM))
+        },
+        "the fact pushed from A",
+    );
+    // The fact travels while A's session is still open.
+    assert_eq!(homes.a.query_i64("SELECT ended FROM sessions"), 0);
+    assert_eq!(fake.requests(Route::Episode), 0);
+
+    homes.pull_on_b(&fake, PNPM);
+    let reply = user_prompt_in(&homes.b, &homes.b_repo, "should I use pnpm or npm?");
+    assert!(reply.contains(PNPM), "{reply}");
+}
+
+#[test]
+fn an_episode_after_session_end_is_recalled_on_another_home() {
+    let fake = FakeService::start(100);
+    let homes = TwoHomes::new(&fake);
+    fake.script(Route::Episode, StatusCode::OK, json!({"episode": EPISODE}));
+    let _a_daemon = homes.a.start_daemon();
+    let _b_daemon = homes.b.start_daemon();
+    homes.b.wait_for_embedder();
+
+    homes.on_a("capture", "stop.json");
+    homes.on_a("session_end", "session_end.json");
+    wait_for(
+        || pushed_episode(&fake).is_some(),
+        "the episode pushed from A",
+    );
+    let episode = pushed_episode(&fake).unwrap();
+    assert_eq!(episode.scope, Some(Scope::Project));
+    assert_eq!(episode.project_id.as_deref(), Some(WEB));
+
+    homes.pull_on_b(&fake, EPISODE);
+    let episodes = fake
+        .records(USER)
+        .into_iter()
+        .filter(|record| record.record_type == Some(RecordType::Episode))
+        .count();
+    assert_eq!(episodes, 1);
+    let question = "how did the move of the build to pnpm go?";
+    let elsewhere = user_prompt_in(&homes.b, homes.b.dir.path(), question);
+    assert!(!elsewhere.contains("move the build to pnpm"), "{elsewhere}");
+    let reply = user_prompt_in(&homes.b, &homes.b_repo, question);
+    assert!(reply.contains("move the build to pnpm"), "{reply}");
+}
+
+#[test]
+fn an_episode_after_idle_time_is_recalled_on_another_home() {
+    let fake = FakeService::start(100);
+    let homes = TwoHomes::new(&fake);
+    fake.script(Route::Episode, StatusCode::OK, json!({"episode": EPISODE}));
+    {
+        let store = homes.a.store();
+        store
+            .upsert_session("s0", "claude-code", WEB, None)
+            .unwrap();
+        store
+            .commit_turn(QueuedTurn {
+                session_id: "s0",
+                agent: "claude-code",
+                project_id: WEB,
+                turn: r#"{"prompt":"Move the build to pnpm"}"#,
+                next_offset: 0,
+                now_ms: now_ms() - 50 * 60 * 1000,
+            })
+            .unwrap();
+    }
+    let _a_daemon = homes.a.start_daemon();
+    let _b_daemon = homes.b.start_daemon();
+    homes.b.wait_for_embedder();
+
+    wait_for(
+        || pushed_episode(&fake).is_some(),
+        "the idle episode pushed from A",
+    );
+    assert_eq!(homes.a.query_i64("SELECT ended FROM sessions"), 0);
+    homes.pull_on_b(&fake, EPISODE);
+    let reply = user_prompt_in(
+        &homes.b,
+        &homes.b_repo,
+        "how did the move of the build to pnpm go?",
+    );
+    assert!(reply.contains("move the build to pnpm"), "{reply}");
 }

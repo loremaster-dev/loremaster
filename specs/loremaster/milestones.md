@@ -204,7 +204,7 @@ Recall probe: pipe `UserPromptSubmit` hook JSON to `loremaster hook claude-code 
     - Verify (Dev stack) [approval]:
       - `loremaster dev eval <dir>` on the 20 labeled sessions → report with >= 80% expected stored, <= 20% junk, >= 80% injected relevant, 0 project leaks, 100% contradiction cases with only the newer fact injected.
       - Eval directory with a known wrong result → that score falls below its limit, exit non-zero.
-  - F6. Extraction across devices: extracted facts and episodes reach another device. Docs: tasks. Needs: F4, M3 F3. Status: not started.
+  - F6. Extraction across devices: extracted facts and episodes reach another device. Docs: tasks. Needs: F4, M3 F3. Status: done.
     - Verify (Two homes on the Dev stack) [approval]:
       - Preference stated on A → recall probe on B returns it within 10 min, while A's session continues.
       - SessionEnd on A → episode recallable on B within 10 min.
